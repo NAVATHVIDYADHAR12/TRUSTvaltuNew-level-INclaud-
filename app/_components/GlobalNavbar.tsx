@@ -14,10 +14,10 @@ const GlobalNavbar = () => {
     const [drmSettings, setDrmSettings] = useState({
         screenshotBlocking: true,
         tabFocusProtection: true,
-        devToolsDetection: false,
+        devToolsDetection: true,
         rightClickDisable: true,
         screenRecordingBlock: true,
-        watermarkOverlay: false,
+        watermarkOverlay: true,
         forensicWatermark: true,
         mediaRecorderBlock: true,
         pipBlock: true,

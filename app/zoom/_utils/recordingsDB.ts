@@ -1,8 +1,11 @@
-// IndexedDB helper for Zoom recordings with Recycle Bin support
-const DB_NAME = 'CreatorSecureDB';
-const STORE_NAME = 'zoomRecordings';
-const TRASH_STORE_NAME = 'recycleBin';
-const DB_VERSION = 3; // Bump to match ChatDB
+// IndexedDB helper for Zoom recordings with Recycle Bin support.
+// Uses a DEDICATED database ('TVaultRecordings') so it never conflicts
+// with other stores that may be at different versions or in bad states.
+
+const DB_NAME = 'TVaultRecordings';
+const DB_VERSION = 1;
+const STORE = 'recordings';
+const TRASH = 'trash';
 
 export interface ZoomRecording {
     id: string;
@@ -12,179 +15,181 @@ export interface ZoomRecording {
     size: string;
     blob: Blob;
     timestamp: number;
-    deletedAt?: number; // Timestamp when moved to trash
+    deletedAt?: number;
 }
 
-export const openDB = (): Promise<IDBDatabase> => {
-    return new Promise((resolve, reject) => {
-        const request = indexedDB.open(DB_NAME, DB_VERSION);
+// ── Internal stored format ─────────────────────────────────────────────────────
+// Blobs can silently fail to persist in some browser/security contexts.
+// ArrayBuffer is always structured-cloneable and universally reliable.
+interface Stored extends Omit<ZoomRecording, 'blob'> {
+    blobData: ArrayBuffer;
+    blobType: string;
+}
 
-        request.onerror = () => reject(request.error);
-        request.onsuccess = () => resolve(request.result);
+// Blob → ArrayBuffer via FileReader (widest browser support, avoids blob.arrayBuffer() quirks)
+const blobToAB = (blob: Blob): Promise<ArrayBuffer> =>
+    new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as ArrayBuffer);
+        reader.onerror = () => reject(reader.error ?? new Error('FileReader failed'));
+        reader.readAsArrayBuffer(blob);
+    });
 
-        request.onupgradeneeded = (event) => {
-            const db = (event.target as IDBOpenDBRequest).result;
-            if (!db.objectStoreNames.contains(STORE_NAME)) {
-                db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+// ZoomRecording → Stored
+const pack = async (r: ZoomRecording): Promise<Stored> => {
+    const blobData = await blobToAB(r.blob);
+    const { blob, ...rest } = r;
+    return { ...rest, blobData, blobType: r.blob.type || 'video/webm' };
+};
+
+// Stored (or legacy Blob format) → ZoomRecording
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const unpack = (s: any): ZoomRecording => {
+    if (s && s.blobData instanceof ArrayBuffer) {
+        const { blobData, blobType, ...rest } = s;
+        return { ...rest, blob: new Blob([blobData], { type: blobType || 'video/webm' }) };
+    }
+    return s as ZoomRecording; // legacy: blob stored directly — return as-is
+};
+
+// ── DB open ────────────────────────────────────────────────────────────────────
+const openDB = (): Promise<IDBDatabase> =>
+    new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, DB_VERSION);
+        req.onerror = () => reject(req.error ?? new Error('IDB open failed'));
+        req.onsuccess = () => resolve(req.result);
+        req.onupgradeneeded = (e) => {
+            const db = (e.target as IDBOpenDBRequest).result;
+            if (!db.objectStoreNames.contains(STORE)) {
+                db.createObjectStore(STORE, { keyPath: 'id' });
             }
-            // Add Recycle Bin store
-            if (!db.objectStoreNames.contains(TRASH_STORE_NAME)) {
-                db.createObjectStore(TRASH_STORE_NAME, { keyPath: 'id' });
-            }
-            // Add Chat History store (ensure compatibility with chatDB)
-            if (!db.objectStoreNames.contains('chatHistory')) {
-                db.createObjectStore('chatHistory', { keyPath: 'id' });
+            if (!db.objectStoreNames.contains(TRASH)) {
+                db.createObjectStore(TRASH, { keyPath: 'id' });
             }
         };
     });
-};
 
+// ── Save ───────────────────────────────────────────────────────────────────────
 export const saveRecording = async (recording: ZoomRecording): Promise<void> => {
+    // Convert blob FIRST — before opening DB, to surface any read errors early
+    const stored = await pack(recording);
     const db = await openDB();
-    return new Promise((resolve, reject) => {
-        const transaction = db.transaction(STORE_NAME, 'readwrite');
-        const store = transaction.objectStore(STORE_NAME);
-        const request = store.put(recording);
 
-        request.onsuccess = () => resolve();
-        request.onerror = () => reject(request.error);
+    return new Promise((resolve, reject) => {
+        let tx: IDBTransaction;
+        try {
+            tx = db.transaction(STORE, 'readwrite');
+            tx.objectStore(STORE).put(stored);
+        } catch (e) {
+            reject(e);
+            return;
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error ?? new Error('IDB write error'));
+        tx.onabort = () => reject(new Error('IDB transaction aborted: ' + (tx.error?.message ?? 'unknown')));
     });
 };
 
+// ── Read all recordings ────────────────────────────────────────────────────────
 export const getAllRecordings = async (): Promise<ZoomRecording[]> => {
     const db = await openDB();
     return new Promise((resolve, reject) => {
-        const transaction = db.transaction(STORE_NAME, 'readonly');
-        const store = transaction.objectStore(STORE_NAME);
-        const request = store.getAll();
-
-        request.onsuccess = () => {
-            const recordings = request.result.sort((a, b) => b.timestamp - a.timestamp);
-            resolve(recordings);
-        };
-        request.onerror = () => reject(request.error);
+        const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll();
+        req.onsuccess = () =>
+            resolve((req.result ?? []).map(unpack).sort((a, b) => b.timestamp - a.timestamp));
+        req.onerror = () => reject(req.error);
     });
 };
 
+// ── Read by ID ─────────────────────────────────────────────────────────────────
 export const getRecordingById = async (id: string): Promise<ZoomRecording | undefined> => {
     const db = await openDB();
     return new Promise((resolve, reject) => {
-        const transaction = db.transaction(STORE_NAME, 'readonly');
-        const store = transaction.objectStore(STORE_NAME);
-        const request = store.get(id);
-
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
+        const req = db.transaction(STORE, 'readonly').objectStore(STORE).get(id);
+        req.onsuccess = () => resolve(req.result ? unpack(req.result) : undefined);
+        req.onerror = () => reject(req.error);
     });
 };
 
-// Move to Recycle Bin instead of permanent delete
+// ── Move to Recycle Bin ────────────────────────────────────────────────────────
+// Reads the raw stored record (already ArrayBuffer) and copies directly to
+// trash — no Blob conversion needed so no format mismatch can occur.
 export const moveToTrash = async (id: string): Promise<void> => {
     const db = await openDB();
-
-    // Get the recording first
-    const recording = await getRecordingById(id);
-    if (!recording) return;
-
-    // Add deletedAt timestamp
-    const trashRecording: ZoomRecording = {
-        ...recording,
-        deletedAt: Date.now()
-    };
-
     return new Promise((resolve, reject) => {
-        const transaction = db.transaction([STORE_NAME, TRASH_STORE_NAME], 'readwrite');
-        const mainStore = transaction.objectStore(STORE_NAME);
-        const trashStore = transaction.objectStore(TRASH_STORE_NAME);
+        const readReq = db.transaction(STORE, 'readonly').objectStore(STORE).get(id);
+        readReq.onsuccess = () => {
+            const record = readReq.result;
+            if (!record) { resolve(); return; }
 
-        // Add to trash
-        trashStore.put(trashRecording);
-        // Remove from main store
-        mainStore.delete(id);
+            let tx: IDBTransaction;
+            try {
+                tx = db.transaction([STORE, TRASH], 'readwrite');
+                tx.objectStore(TRASH).put({ ...record, deletedAt: Date.now() });
+                tx.objectStore(STORE).delete(id);
+            } catch (e) { reject(e); return; }
 
-        transaction.oncomplete = () => resolve();
-        transaction.onerror = () => reject(transaction.error);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+        };
+        readReq.onerror = () => reject(readReq.error);
     });
 };
 
-// Get all recordings from Recycle Bin
+// ── Get all trash recordings ───────────────────────────────────────────────────
 export const getTrashRecordings = async (): Promise<ZoomRecording[]> => {
     const db = await openDB();
     return new Promise((resolve, reject) => {
-        const transaction = db.transaction(TRASH_STORE_NAME, 'readonly');
-        const store = transaction.objectStore(TRASH_STORE_NAME);
-        const request = store.getAll();
-
-        request.onsuccess = () => {
-            const recordings = request.result.sort((a, b) => (b.deletedAt || 0) - (a.deletedAt || 0));
-            resolve(recordings);
-        };
-        request.onerror = () => reject(request.error);
+        const req = db.transaction(TRASH, 'readonly').objectStore(TRASH).getAll();
+        req.onsuccess = () =>
+            resolve((req.result ?? []).map(unpack).sort((a, b) => (b.deletedAt ?? 0) - (a.deletedAt ?? 0)));
+        req.onerror = () => reject(req.error);
     });
 };
 
-// Restore from Recycle Bin
+// ── Restore from Recycle Bin ──────────────────────────────────────────────────
 export const restoreFromTrash = async (id: string): Promise<void> => {
     const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const readReq = db.transaction(TRASH, 'readonly').objectStore(TRASH).get(id);
+        readReq.onsuccess = () => {
+            const record = readReq.result;
+            if (!record) { reject(new Error('Recording not found in trash')); return; }
 
-    return new Promise(async (resolve, reject) => {
-        const getTransaction = db.transaction(TRASH_STORE_NAME, 'readonly');
-        const trashStore = getTransaction.objectStore(TRASH_STORE_NAME);
-        const getRequest = trashStore.get(id);
+            const { deletedAt: _removed, ...restored } = record;
+            let tx: IDBTransaction;
+            try {
+                tx = db.transaction([STORE, TRASH], 'readwrite');
+                tx.objectStore(STORE).put(restored);
+                tx.objectStore(TRASH).delete(id);
+            } catch (e) { reject(e); return; }
 
-        getRequest.onsuccess = () => {
-            const recording = getRequest.result;
-            if (!recording) {
-                reject(new Error('Recording not found in trash'));
-                return;
-            }
-
-            // Remove deletedAt and restore
-            delete recording.deletedAt;
-
-            const writeTransaction = db.transaction([STORE_NAME, TRASH_STORE_NAME], 'readwrite');
-            const mainStore = writeTransaction.objectStore(STORE_NAME);
-            const trashWriteStore = writeTransaction.objectStore(TRASH_STORE_NAME);
-
-            // Add back to main store
-            mainStore.put(recording);
-            // Remove from trash
-            trashWriteStore.delete(id);
-
-            writeTransaction.oncomplete = () => resolve();
-            writeTransaction.onerror = () => reject(writeTransaction.error);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
         };
-        getRequest.onerror = () => reject(getRequest.error);
+        readReq.onerror = () => reject(readReq.error);
     });
 };
 
-// Permanently delete from Recycle Bin
+// ── Permanently delete from Recycle Bin ───────────────────────────────────────
 export const permanentlyDelete = async (id: string): Promise<void> => {
     const db = await openDB();
     return new Promise((resolve, reject) => {
-        const transaction = db.transaction(TRASH_STORE_NAME, 'readwrite');
-        const store = transaction.objectStore(TRASH_STORE_NAME);
-        const request = store.delete(id);
-
-        request.onsuccess = () => resolve();
-        request.onerror = () => reject(request.error);
+        const req = db.transaction(TRASH, 'readwrite').objectStore(TRASH).delete(id);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
     });
 };
 
-// Empty entire Recycle Bin
+// ── Empty entire Recycle Bin ───────────────────────────────────────────────────
 export const emptyTrash = async (): Promise<void> => {
     const db = await openDB();
     return new Promise((resolve, reject) => {
-        const transaction = db.transaction(TRASH_STORE_NAME, 'readwrite');
-        const store = transaction.objectStore(TRASH_STORE_NAME);
-        const request = store.clear();
-
-        request.onsuccess = () => resolve();
-        request.onerror = () => reject(request.error);
+        const req = db.transaction(TRASH, 'readwrite').objectStore(TRASH).clear();
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
     });
 };
 
-// Legacy delete function (now uses moveToTrash)
-export const deleteRecording = async (id: string): Promise<void> => {
-    return moveToTrash(id);
-};
+// ── Legacy alias ───────────────────────────────────────────────────────────────
+export const deleteRecording = moveToTrash;

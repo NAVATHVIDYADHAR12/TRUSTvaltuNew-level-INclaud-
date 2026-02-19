@@ -1,110 +1,244 @@
 "use client";
 
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import GlobalNavbar from '../../_components/GlobalNavbar';
-import { Video, Mic, MicOff, Camera, CameraOff, PhoneOff, Copy, Users, Shield, Circle, Square, Share2, Check, AlertTriangle } from 'lucide-react';
+import {
+    Mic, MicOff, Camera, CameraOff, PhoneOff, Copy, Users, Shield, Circle, Square,
+    Share2, Check, AlertTriangle, Loader2, Monitor, MonitorOff, MessageSquare,
+    Heart, X, Send, BarChart2, ChevronDown
+} from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { saveRecording, ZoomRecording } from '../_utils/recordingsDB';
+import { saveChatSession, calculateChatSize, ChatMessage } from '../_utils/chatDB';
 import {
     initAdvancedDRM,
     blockPictureInPicture,
     createProtectionOverlay,
     ForensicWatermark,
-    VisibilityMonitor,
-    generateSessionFingerprint
 } from '../_utils/advancedDRM';
 
-// DRM Protection Hook
+// ── Capture the REAL MediaRecorder at module load time ────────────────────────
+// Must be at module scope — before React/DRM can replace window.MediaRecorder.
+const REAL_MEDIA_RECORDER: (typeof MediaRecorder) | null =
+    typeof window !== 'undefined' ? window.MediaRecorder : null;
+
+// ── In-room message type ───────────────────────────────────────────────────────
+interface InRoomMsg {
+    id: string;
+    text: string;
+    sender: 'me' | 'remote';
+    timestamp: number;
+}
+
+// ── Reaction definitions ───────────────────────────────────────────────────────
+type ReactionKey = 'agree' | 'thumbsup' | 'clap' | 'disagree' | 'heart' | 'hand';
+const REACTION_EMOJIS: Record<ReactionKey, string> = {
+    agree: '✅', thumbsup: '👍', clap: '👏', disagree: '❌', heart: '❤️', hand: '✋'
+};
+const REACTION_LABELS: Record<ReactionKey, string> = {
+    agree: 'Agree', thumbsup: 'Thumbs Up', clap: 'Clap', disagree: 'Disagree', heart: 'Heart', hand: 'Raise Hand'
+};
+
+// ── DRM Protection Hook ────────────────────────────────────────────────────────
 const useDRMProtection = () => {
     const [drmEnabled, setDrmEnabled] = useState(true);
     const [drmSettings, setDrmSettings] = useState({
         screenshotBlocking: true,
         tabFocusProtection: true,
-        devToolsDetection: false,
+        devToolsDetection: true,
         rightClickDisable: true,
         screenRecordingBlock: true,
-        watermarkOverlay: false,
-        // Advanced DRM features
+        watermarkOverlay: true,
         forensicWatermark: true,
         mediaRecorderBlock: true,
         pipBlock: true,
         heartbeatProtection: true
     });
 
-    // Load initial settings from localStorage
     useEffect(() => {
         if (typeof window !== 'undefined') {
             const savedEnabled = localStorage.getItem('drmProtectionEnabled');
             setDrmEnabled(savedEnabled !== 'false');
-
             const savedSettings = localStorage.getItem('drmSettings');
             if (savedSettings) {
-                try {
-                    setDrmSettings(JSON.parse(savedSettings));
-                } catch (e) {
-                    console.error('Failed to parse DRM settings');
-                }
+                try { setDrmSettings(JSON.parse(savedSettings)); } catch (_) { /* ignore */ }
             }
         }
     }, []);
 
-    // Listen for real-time DRM settings changes from navbar modal
     useEffect(() => {
-        const handleSettingsChange = (event: Event) => {
-            const customEvent = event as CustomEvent;
-            if (customEvent.detail) {
-                console.log('DRM Settings Changed:', customEvent.detail);
-                setDrmSettings(customEvent.detail);
-            }
+        const handleSettingsChange = (e: Event) => {
+            const ce = e as CustomEvent;
+            if (ce.detail) setDrmSettings(ce.detail);
         };
-
         window.addEventListener('drmSettingsChanged', handleSettingsChange);
-
-        return () => {
-            window.removeEventListener('drmSettingsChanged', handleSettingsChange);
-        };
+        return () => window.removeEventListener('drmSettingsChanged', handleSettingsChange);
     }, []);
 
-    return { drmEnabled, drmSettings, setDrmSettings };
+    return { drmEnabled, drmSettings };
 };
 
+// ── Component ──────────────────────────────────────────────────────────────────
 export default function MeetingRoomPage() {
     const params = useParams();
     const router = useRouter();
     const roomId = (params?.roomId as string) || '';
 
-    const videoRef = useRef<HTMLVideoElement>(null);
+    // ── Video refs ────────────────────────────────────────────────────────────
+    const localVideoRef = useRef<HTMLVideoElement>(null);
+    const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+    const videoContainerRef = useRef<HTMLDivElement>(null);
+
+    // ── Recording refs ────────────────────────────────────────────────────────
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
     const recordedChunksRef = useRef<Blob[]>([]);
     const recordingStartTimeRef = useRef<number>(0);
 
+    // ── Mixed-recording refs (canvas + AudioContext) ───────────────────────────
+    const remoteStreamRef = useRef<MediaStream | null>(null);
+    const mixedCanvasRef = useRef<HTMLCanvasElement | null>(null);
+    const rafRef = useRef<number>(0);
+    const audioCtxRef = useRef<AudioContext | null>(null);
+
+    // ── WebRTC refs ───────────────────────────────────────────────────────────
+    const pcRef = useRef<RTCPeerConnection | null>(null);
+    const webrtcSetupDoneRef = useRef(false);
+    const webrtcIntervalRef = useRef<NodeJS.Timeout | null>(null);
+    const callerCandidatesAdded = useRef(0);
+    const calleeCandidatesAdded = useRef(0);
+
+    // ── Data channel ref ──────────────────────────────────────────────────────
+    const dataChannelRef = useRef<RTCDataChannel | null>(null);
+
+    // ── Screen-share refs ─────────────────────────────────────────────────────
+    const screenShareStreamRef = useRef<MediaStream | null>(null);
+    const screenShareSenderRef = useRef<RTCRtpSender | null>(null);
+
+    // ── Misc refs ─────────────────────────────────────────────────────────────
+    const isEndingCallRef = useRef(false);
+    const recordingTimeRef = useRef(0);
+    const chatEndRef = useRef<HTMLDivElement>(null);
+
+    // ── Watermark closure-control ref ────────────────────────────────────────
+    // createMixedStream stores a setter here that directly mutates the local
+    // closure variables — zero async delay, no stale refs.
+    const wmControlRef = useRef<((active: boolean, label: string) => void) | null>(null);
+
+    // ── Core state ────────────────────────────────────────────────────────────
     const [stream, setStream] = useState<MediaStream | null>(null);
+    const [connectionState, setConnectionState] = useState<'waiting' | 'connecting' | 'connected' | 'disconnected'>('waiting');
     const [micEnabled, setMicEnabled] = useState(true);
     const [cameraEnabled, setCameraEnabled] = useState(true);
     const [isRecording, setIsRecording] = useState(false);
     const [recordingTime, setRecordingTime] = useState(0);
     const [showInviteModal, setShowInviteModal] = useState(false);
     const [linkCopied, setLinkCopied] = useState(false);
-    const [participants] = useState(['You', 'Guest User']);
     const [showDRMOverlay, setShowDRMOverlay] = useState(false);
     const [recordingSaved, setRecordingSaved] = useState(false);
+    const [saveError, setSaveError] = useState<string | null>(null);
     const [autoRecordingStarted, setAutoRecordingStarted] = useState(false);
-    const [sessionFingerprint, setSessionFingerprint] = useState<string>('');
+    const [sessionFingerprint, setSessionFingerprint] = useState('');
     const [drmViolationCount, setDrmViolationCount] = useState(0);
     const [advancedDRMActive, setAdvancedDRMActive] = useState(false);
-    const videoContainerRef = useRef<HTMLDivElement>(null);
+    const [isEndingCall, setIsEndingCall] = useState(false);
+
+    // ── Screen-share state ────────────────────────────────────────────────────
+    const [isScreenSharing, setIsScreenSharing] = useState(false);
+    const [remoteScreenSharing, setRemoteScreenSharing] = useState(false);
+    const [screenSharePending, setScreenSharePending] = useState(false);
+    const [screenShareRequest, setScreenShareRequest] = useState<string | null>(null);
+    const [screenShareApproved, setScreenShareApproved] = useState(false);
+
+    // ── In-room chat state ────────────────────────────────────────────────────
+    const [showChatPanel, setShowChatPanel] = useState(false);
+    const [chatTab, setChatTab] = useState<'group' | 'private' | 'poll'>('group');
+    const [groupMessages, setGroupMessages] = useState<InRoomMsg[]>([]);
+    const [privateMessages, setPrivateMessages] = useState<InRoomMsg[]>([]);
+    const [roomChatInput, setRoomChatInput] = useState('');
+    const [unreadCount, setUnreadCount] = useState(0);
+
+    // ── Reactions state — stores list of sender names per reaction key ────────
+    const [reactionVotes, setReactionVotes] = useState<Record<ReactionKey, string[]>>({
+        agree: [], thumbsup: [], clap: [], disagree: [], heart: [], hand: []
+    });
+    const [showReactionBar, setShowReactionBar] = useState(false);
+    const [floatingReactions, setFloatingReactions] = useState<{ id: number; emoji: string; x: number }[]>([]);
+    const [showReactionPoll, setShowReactionPoll] = useState(false);
 
     const { drmEnabled, drmSettings } = useDRMProtection();
 
-    // Initialize Advanced DRM Protection
+    // ── Push live DRM watermark toggle into the recording canvas closure ──────
+    // Calls the setter stored by createMixedStream — updates take effect within
+    // the very next RAF frame (~16 ms), no stale closure issues.
+    useEffect(() => {
+        const label = `🔒 ${sessionFingerprint || roomId} • ROOM-${roomId} • PROTECTED`;
+        wmControlRef.current?.(drmSettings.watermarkOverlay, label);
+    }, [drmSettings.watermarkOverlay, sessionFingerprint, roomId]);
+
+    // ── Floating reaction animation ───────────────────────────────────────────
+    const addFloatingReaction = useCallback((emoji: string) => {
+        const id = Date.now() + Math.random();
+        const x = 10 + Math.random() * 80;
+        setFloatingReactions(prev => [...prev, { id, emoji, x }]);
+        setTimeout(() => setFloatingReactions(prev => prev.filter(r => r.id !== id)), 3000);
+    }, []);
+
+    // ── Data channel message handler ──────────────────────────────────────────
+    const setupDataChannel = useCallback((dc: RTCDataChannel) => {
+        dc.onmessage = (e) => {
+            try {
+                const msg = JSON.parse(e.data);
+                switch (msg.type) {
+                    case 'group-chat':
+                        setGroupMessages(prev => [...prev, { id: msg.id, text: msg.text, sender: 'remote', timestamp: msg.timestamp }]);
+                        setUnreadCount(prev => prev + 1);
+                        break;
+                    case 'private-chat':
+                        setPrivateMessages(prev => [...prev, { id: msg.id, text: msg.text, sender: 'remote', timestamp: msg.timestamp }]);
+                        setUnreadCount(prev => prev + 1);
+                        break;
+                    case 'reaction':
+                        setReactionVotes(prev => ({ ...prev, [msg.emoji]: [...(prev[msg.emoji as ReactionKey] || []), 'Participant'] }));
+                        addFloatingReaction(REACTION_EMOJIS[msg.emoji as ReactionKey] || msg.emoji);
+                        break;
+                    case 'screen-share-start':
+                        setRemoteScreenSharing(true);
+                        break;
+                    case 'screen-share-stop':
+                        setRemoteScreenSharing(false);
+                        break;
+                    case 'screen-share-request':
+                        setScreenShareRequest(msg.sender || 'Remote peer');
+                        break;
+                    case 'screen-share-approve':
+                        setScreenSharePending(false);
+                        setScreenShareApproved(true);
+                        break;
+                    case 'screen-share-deny':
+                        setScreenSharePending(false);
+                        break;
+                }
+            } catch (_) { /* ignore malformed */ }
+        };
+        dc.onopen = () => console.log('📡 Data channel open');
+        dc.onclose = () => console.log('📡 Data channel closed');
+    }, [addFloatingReaction]);
+
+    const sendDataMessage = useCallback((data: object) => {
+        if (dataChannelRef.current?.readyState === 'open') {
+            dataChannelRef.current.send(JSON.stringify(data));
+        }
+    }, []);
+
+    // ── Effect 1: Initialize Advanced DRM ─────────────────────────────────────
     useEffect(() => {
         if (drmEnabled && !advancedDRMActive) {
             const { fingerprint, cleanup } = initAdvancedDRM({
                 userId: `user-${roomId}`,
                 sessionId: `session-${Date.now()}`,
                 enableForensicWatermark: drmSettings.forensicWatermark,
-                enableMediaRecorderBlock: drmSettings.mediaRecorderBlock,
+                enableMediaRecorderBlock: false,
                 enablePiPBlock: drmSettings.pipBlock,
                 enableDevToolsDetection: drmSettings.devToolsDetection,
                 enableCanvasProtection: drmSettings.screenshotBlocking,
@@ -114,257 +248,324 @@ export default function MeetingRoomPage() {
             setSessionFingerprint(fingerprint);
             setAdvancedDRMActive(true);
 
-            // Listen for DRM violations
-            const handleViolation = (e: Event) => {
-                const detail = (e as CustomEvent).detail;
+            const handleViolation = () => {
                 setDrmViolationCount(prev => prev + 1);
-                console.warn(`DRM Violation #${drmViolationCount + 1}: ${detail.type}`);
-
-                // Show warning overlay
                 setShowDRMOverlay(true);
                 setTimeout(() => setShowDRMOverlay(false), 5000);
             };
-
             window.addEventListener('drmViolation', handleViolation);
-
             return () => {
                 cleanup();
                 window.removeEventListener('drmViolation', handleViolation);
             };
         }
-    }, [drmEnabled, drmSettings, advancedDRMActive, roomId, drmViolationCount]);
+    }, [drmEnabled, drmSettings, advancedDRMActive, roomId]);
 
-    // Block PiP on video element
+    // ── Effect 2: Block Picture-in-Picture ─────────────────────────────────────
     useEffect(() => {
-        if (videoRef.current && drmEnabled && drmSettings.pipBlock) {
-            blockPictureInPicture(videoRef.current);
+        if (localVideoRef.current && drmEnabled && drmSettings.pipBlock) {
+            blockPictureInPicture(localVideoRef.current);
         }
     }, [stream, drmEnabled, drmSettings.pipBlock]);
 
-    // Create protection overlay on video container
+    // ── Effect 3: Canvas protection overlay ────────────────────────────────────
     useEffect(() => {
         if (videoContainerRef.current && drmEnabled && drmSettings.screenshotBlocking) {
             const overlay = createProtectionOverlay(videoContainerRef.current);
-            return () => {
-                overlay.remove();
-            };
+            return () => overlay.remove();
         }
     }, [drmEnabled, drmSettings.screenshotBlocking]);
 
-    // Forensic Watermark Overlay
+    // ── Effect 4: Forensic watermark ───────────────────────────────────────────
     useEffect(() => {
         if (videoContainerRef.current && drmEnabled && drmSettings.forensicWatermark && roomId) {
             const watermark = new ForensicWatermark(`user-${roomId}`);
             const { clientWidth, clientHeight } = videoContainerRef.current;
-            // Ensure dimensions are valid
             if (clientWidth > 0 && clientHeight > 0) {
                 const canvas = watermark.createWatermarkOverlay(clientWidth, clientHeight);
-
-                canvas.style.position = 'absolute';
-                canvas.style.top = '0';
-                canvas.style.left = '0';
-                canvas.style.pointerEvents = 'none';
-                canvas.style.zIndex = '20';
-                canvas.style.opacity = '0.01'; // Almost invisible
-
+                canvas.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;z-index:20;opacity:0.01;';
                 videoContainerRef.current.appendChild(canvas);
-
-                return () => {
-                    canvas.remove();
-                };
+                return () => canvas.remove();
             }
         }
     }, [drmEnabled, drmSettings.forensicWatermark, roomId]);
 
-    // Start camera/mic on mount
+    // ── Effect 5: Start camera + mic ───────────────────────────────────────────
     useEffect(() => {
         const startMedia = async () => {
             try {
-                const mediaStream = await navigator.mediaDevices.getUserMedia({
-                    video: true,
-                    audio: true
-                });
+                const mediaStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
                 setStream(mediaStream);
-                if (videoRef.current) {
-                    videoRef.current.srcObject = mediaStream;
+                if (localVideoRef.current) {
+                    localVideoRef.current.srcObject = mediaStream;
                 }
-            } catch (err) {
-                console.error('Media access error:', err);
+            } catch (_) {
+                // Camera access denied
             }
         };
         startMedia();
-
         return () => {
-            if (stream) {
-                stream.getTracks().forEach(track => track.stop());
-            }
+            // eslint-disable-next-line react-hooks/exhaustive-deps
+            stream?.getTracks().forEach(t => t.stop());
         };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    // Recording timer
+    // ── Effect 6: WebRTC Peer Connection ───────────────────────────────────────
+    useEffect(() => {
+        if (!stream || webrtcSetupDoneRef.current) return;
+        webrtcSetupDoneRef.current = true;
+
+        const pc = new RTCPeerConnection({
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' },
+            ]
+        });
+        pcRef.current = pc;
+
+        // Capture remote stream for mixed recording + play it
+        pc.ontrack = (event) => {
+            if (remoteVideoRef.current && event.streams[0]) {
+                remoteVideoRef.current.srcObject = event.streams[0];
+                remoteStreamRef.current = event.streams[0];
+                setConnectionState('connected');
+            }
+        };
+
+        pc.onconnectionstatechange = () => {
+            if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+                setConnectionState('disconnected');
+            }
+        };
+
+        // Callee receives data channel
+        pc.ondatachannel = (e) => {
+            dataChannelRef.current = e.channel;
+            setupDataChannel(e.channel);
+        };
+
+        // Add local tracks — capture video sender for screen-share replaceTrack
+        stream.getTracks().forEach(track => {
+            const sender = pc.addTrack(track, stream);
+            if (track.kind === 'video') {
+                screenShareSenderRef.current = sender;
+            }
+        });
+
+        const setupSignaling = async () => {
+            try {
+                const res = await fetch(`/api/zoom/signal?roomId=${roomId}`);
+                const roomData = await res.json();
+
+                if (!roomData.offer) {
+                    // ── CALLER ─────────────────────────────────────────────────
+                    setConnectionState('waiting');
+
+                    // Create data channel BEFORE offer so it's included in SDP
+                    const dc = pc.createDataChannel('tvault', { ordered: true });
+                    dataChannelRef.current = dc;
+                    setupDataChannel(dc);
+
+                    pc.onicecandidate = async (event) => {
+                        if (event.candidate) {
+                            await fetch('/api/zoom/signal', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ roomId, type: 'offerCandidate', data: event.candidate.toJSON() })
+                            });
+                        }
+                    };
+
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    await fetch('/api/zoom/signal', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ roomId, type: 'offer', data: { type: offer.type, sdp: offer.sdp } })
+                    });
+
+                    const interval = setInterval(async () => {
+                        try {
+                            const r = await fetch(`/api/zoom/signal?roomId=${roomId}`);
+                            const d = await r.json();
+                            if (d.answer && !pc.remoteDescription) {
+                                await pc.setRemoteDescription(new RTCSessionDescription(d.answer));
+                                setConnectionState('connecting');
+                            }
+                            if (pc.remoteDescription) {
+                                const candidates: RTCIceCandidateInit[] = d.answerCandidates || [];
+                                while (calleeCandidatesAdded.current < candidates.length) {
+                                    await pc.addIceCandidate(new RTCIceCandidate(candidates[calleeCandidatesAdded.current]));
+                                    calleeCandidatesAdded.current++;
+                                }
+                            }
+                        } catch (_) { /* ignore */ }
+                    }, 2000);
+                    webrtcIntervalRef.current = interval;
+
+                } else {
+                    // ── CALLEE ─────────────────────────────────────────────────
+                    setConnectionState('connecting');
+                    await pc.setRemoteDescription(new RTCSessionDescription(roomData.offer));
+
+                    pc.onicecandidate = async (event) => {
+                        if (event.candidate) {
+                            await fetch('/api/zoom/signal', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ roomId, type: 'answerCandidate', data: event.candidate.toJSON() })
+                            });
+                        }
+                    };
+
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    await fetch('/api/zoom/signal', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ roomId, type: 'answer', data: { type: answer.type, sdp: answer.sdp } })
+                    });
+
+                    const existing: RTCIceCandidateInit[] = roomData.offerCandidates || [];
+                    for (const c of existing) {
+                        await pc.addIceCandidate(new RTCIceCandidate(c));
+                        callerCandidatesAdded.current++;
+                    }
+
+                    const interval = setInterval(async () => {
+                        try {
+                            const r = await fetch(`/api/zoom/signal?roomId=${roomId}`);
+                            const d = await r.json();
+                            const candidates: RTCIceCandidateInit[] = d.offerCandidates || [];
+                            while (callerCandidatesAdded.current < candidates.length) {
+                                await pc.addIceCandidate(new RTCIceCandidate(candidates[callerCandidatesAdded.current]));
+                                callerCandidatesAdded.current++;
+                            }
+                        } catch (_) { /* ignore */ }
+                    }, 2000);
+                    webrtcIntervalRef.current = interval;
+                }
+            } catch (_) {
+                // Signaling unavailable — solo mode
+            }
+        };
+
+        setupSignaling();
+        return () => {
+            if (webrtcIntervalRef.current) clearInterval(webrtcIntervalRef.current);
+        };
+    }, [stream, roomId, setupDataChannel]);
+
+    // ── Effect 7: Recording timer ──────────────────────────────────────────────
     useEffect(() => {
         let interval: NodeJS.Timeout;
         if (isRecording) {
-            interval = setInterval(() => {
-                setRecordingTime(prev => prev + 1);
-            }, 1000);
+            interval = setInterval(() => setRecordingTime(prev => prev + 1), 1000);
         }
         return () => clearInterval(interval);
     }, [isRecording]);
 
-    // AUTO-RECORDING: Start recording automatically when stream is ready
+    // ── Effect 8: Auto-recording ───────────────────────────────────────────────
     useEffect(() => {
         if (stream && !autoRecordingStarted && !isRecording) {
-            // Small delay to ensure stream is fully ready
             const timer = setTimeout(() => {
-                console.log('🎬 Auto-recording started...');
-
                 recordedChunksRef.current = [];
                 recordingStartTimeRef.current = Date.now();
+                const MR = REAL_MEDIA_RECORDER || MediaRecorder;
+                const recordingStream = createMixedStream() || stream;
 
-                try {
-                    const mediaRecorder = new MediaRecorder(stream, {
-                        mimeType: 'video/webm;codecs=vp9'
-                    });
+                const startWithMimeType = (mimeType: string) => {
+                    try {
+                        const mr = new MR(recordingStream, { mimeType });
+                        mr.ondataavailable = (event) => {
+                            if (event.data.size > 0) recordedChunksRef.current.push(event.data);
+                        };
+                        mr.onstop = async () => {
+                            cleanupMixedStream();
+                            const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+                            if (blob.size > 0) {
+                                await handleSaveRecording(blob);
+                            } else if (isEndingCallRef.current) {
+                                router.push('/search?tab=history');
+                            }
+                        };
+                        mr.start(1000);
+                        mediaRecorderRef.current = mr;
+                        setIsRecording(true);
+                        setRecordingTime(0);
+                        setAutoRecordingStarted(true);
+                        return true;
+                    } catch (_) {
+                        return false;
+                    }
+                };
 
-                    mediaRecorder.ondataavailable = (event) => {
-                        if (event.data.size > 0) {
-                            recordedChunksRef.current.push(event.data);
-                        }
-                    };
-
-                    mediaRecorder.onstop = async () => {
-                        const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
-                        if (blob.size > 0) {
-                            await handleSaveRecording(blob);
-                        }
-                    };
-
-                    mediaRecorder.start(1000);
-                    mediaRecorderRef.current = mediaRecorder;
-                    setIsRecording(true);
-                    setRecordingTime(0);
-                    setAutoRecordingStarted(true);
-                } catch (err) {
-                    console.error('Failed to start auto-recording:', err);
+                if (!startWithMimeType('video/webm;codecs=vp9')) {
+                    startWithMimeType('video/webm');
                 }
             }, 1000);
-
             return () => clearTimeout(timer);
         }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [stream, autoRecordingStarted, isRecording]);
 
-    // Enhanced DRM Protection with Aggressive Screenshot Blocking
+    // ── Effect 9: DRM keyboard/context-menu/blur ───────────────────────────────
     useEffect(() => {
         if (!drmEnabled) return;
-
-        // State for screenshot warning
         let screenshotWarningTimeout: NodeJS.Timeout;
 
-        // Tab visibility detection
         const handleVisibilityChange = () => {
-            if (document.hidden && drmSettings.tabFocusProtection) {
-                setShowDRMOverlay(true);
-            } else {
-                setShowDRMOverlay(false);
-            }
+            if (document.hidden && drmSettings.tabFocusProtection) setShowDRMOverlay(true);
+            else setShowDRMOverlay(false);
         };
-
-        // Right-click disable
         const handleContextMenu = (e: MouseEvent) => {
-            if (drmSettings.rightClickDisable) {
-                e.preventDefault();
-            }
+            if (drmSettings.rightClickDisable) e.preventDefault();
         };
-
-        // AGGRESSIVE SCREENSHOT BLOCKING
         const handleKeyDown = (e: KeyboardEvent) => {
-            // DevTools detection
             if (drmSettings.devToolsDetection) {
-                if (e.key === 'F12' || (e.ctrlKey && e.shiftKey && e.key === 'I')) {
+                const isDevTools =
+                    e.key === 'F12' ||
+                    (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'J' || e.key === 'C')) ||
+                    (e.ctrlKey && e.key === 'U');
+                if (isDevTools) {
                     e.preventDefault();
+                    e.stopPropagation();
                     setShowDRMOverlay(true);
                     setTimeout(() => setShowDRMOverlay(false), 20000);
                     return;
                 }
             }
-
-            // SCREENSHOT BLOCKING - Detect PrintScreen and common screenshot shortcuts
             if (drmSettings.screenshotBlocking) {
-                const isScreenshotAttempt =
+                const isScreenshot =
                     e.key === 'PrintScreen' ||
-                    (e.key === 'S' && e.shiftKey && (e.metaKey || e.getModifierState('Meta'))) || // Win+Shift+S
-                    (e.key === 's' && e.shiftKey && e.ctrlKey) || // Some screenshot tools
-                    (e.key === 'Print') ||
-                    (e.key === '3' && e.metaKey && e.shiftKey) || // Mac screenshot
-                    (e.key === '4' && e.metaKey && e.shiftKey) || // Mac screenshot 
-                    (e.key === '5' && e.metaKey && e.shiftKey);   // Mac screenshot
-
-                if (isScreenshotAttempt) {
+                    (e.metaKey && e.shiftKey && (e.key === '3' || e.key === '4' || e.key === '5'));
+                if (isScreenshot) {
                     e.preventDefault();
-                    e.stopPropagation();
-
-                    // Show aggressive warning overlay
                     setShowDRMOverlay(true);
-
-                    // Log the attempt
-                    console.warn('🔒 DRM: Screenshot attempt blocked!');
-
-                    // Hide overlay after 20 seconds
-                    clearTimeout(screenshotWarningTimeout);
-                    screenshotWarningTimeout = setTimeout(() => {
-                        setShowDRMOverlay(false);
-                    }, 20000);
+                    screenshotWarningTimeout = setTimeout(() => setShowDRMOverlay(false), 3000);
                 }
             }
         };
-
-        // Clipboard monitoring - detect if screenshot was taken
         const handleCopy = (e: ClipboardEvent) => {
-            if (drmSettings.screenshotBlocking) {
-                // Check if clipboard contains image data
-                if (e.clipboardData?.types.includes('image/png') ||
-                    e.clipboardData?.types.includes('image/jpeg')) {
-                    e.preventDefault();
-                    setShowDRMOverlay(true);
-                    setTimeout(() => setShowDRMOverlay(false), 20000);
-                }
+            if (drmSettings.rightClickDisable) {
+                e.preventDefault();
+                e.clipboardData?.setData('text/plain', '');
             }
         };
-
-        // Blur event - another tab/app might be taking screenshot
         const handleBlur = () => {
             if (drmSettings.screenshotBlocking) {
-                // Brief flash of overlay to disrupt capture
                 setShowDRMOverlay(true);
-                setTimeout(() => {
-                    if (!document.hidden) {
-                        setShowDRMOverlay(false);
-                    }
-                }, 100);
-            }
-        };
-
-        // Screen recording detection via display-capture permission (experimental)
-        const checkScreenCapture = async () => {
-            try {
-                const permissionStatus = await navigator.permissions.query({ name: 'display-capture' as PermissionName });
-                if (permissionStatus.state === 'granted') {
-                    console.log('DRM Warning: Screen capture may be active');
-                }
-            } catch (e) {
-                // Not supported in all browsers
+                setTimeout(() => { if (!document.hidden) setShowDRMOverlay(false); }, 100);
             }
         };
 
         document.addEventListener('visibilitychange', handleVisibilityChange);
         document.addEventListener('contextmenu', handleContextMenu);
-        document.addEventListener('keydown', handleKeyDown, true); // Use capture phase
+        document.addEventListener('keydown', handleKeyDown, true);
         document.addEventListener('keyup', handleKeyDown, true);
         document.addEventListener('copy', handleCopy);
         window.addEventListener('blur', handleBlur);
-        checkScreenCapture();
-
         return () => {
             document.removeEventListener('visibilitychange', handleVisibilityChange);
             document.removeEventListener('contextmenu', handleContextMenu);
@@ -376,21 +577,270 @@ export default function MeetingRoomPage() {
         };
     }, [drmEnabled, drmSettings]);
 
+    // ── Effect 10: Sync refs ───────────────────────────────────────────────────
+    useEffect(() => { isEndingCallRef.current = isEndingCall; }, [isEndingCall]);
+    useEffect(() => { recordingTimeRef.current = recordingTime; }, [recordingTime]);
+
+    // ── Effect 11: Auto-scroll chat ────────────────────────────────────────────
+    useEffect(() => {
+        chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, [groupMessages, privateMessages]);
+
+    // ── Effect 12: Clear unread when panel opens ───────────────────────────────
+    useEffect(() => {
+        if (showChatPanel) setUnreadCount(0);
+    }, [showChatPanel]);
+
+    // ── Effect 13: Act on screen share approved by host ───────────────────────
+    useEffect(() => {
+        if (screenShareApproved) {
+            setScreenShareApproved(false);
+            startScreenShareActual();
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [screenShareApproved]);
+
+    // ── Mixed Recording: Canvas + AudioContext ────────────────────────────────
+    const createMixedStream = (): MediaStream | null => {
+        try {
+            const localVid = localVideoRef.current;
+            const remoteVid = remoteVideoRef.current;
+            if (!localVid) return null;
+
+            // ── Closure-local watermark state ────────────────────────────────
+            // Captured at recording-start time; updated in real-time via wmControlRef.
+            let wmActive = drmSettings.watermarkOverlay;
+            let wmLabel = `🔒 ${sessionFingerprint || roomId} • ROOM-${roomId} • PROTECTED`;
+            wmControlRef.current = (active: boolean, label: string) => {
+                wmActive = active;
+                wmLabel = label;
+            };
+
+            const canvas = document.createElement('canvas');
+            canvas.width = 1280;
+            canvas.height = 720;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return null;
+            mixedCanvasRef.current = canvas;
+
+            const drawFrame = () => {
+                ctx.fillStyle = '#0a0a0f';
+                ctx.fillRect(0, 0, 1280, 720);
+                if (localVid.readyState >= 2) ctx.drawImage(localVid, 0, 0, 640, 720);
+                if (remoteVid && remoteVid.readyState >= 2) ctx.drawImage(remoteVid, 640, 0, 640, 720);
+
+                // ── Watermark burned into recording canvas ───────────────────
+                if (wmActive) {
+                    ctx.save();
+                    ctx.translate(640, 360);
+                    ctx.rotate(-30 * Math.PI / 180);
+                    ctx.font = 'bold 18px monospace';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    for (let row = -1; row <= 2; row++) {
+                        for (let col = -1; col <= 1; col++) {
+                            const x = col * 380;
+                            const y = row * 130 - 65;
+                            const metrics = ctx.measureText(wmLabel);
+                            const pw = metrics.width + 18;
+                            const ph = 28;
+                            ctx.globalAlpha = 0.72;
+                            ctx.fillStyle = '#000000';
+                            ctx.beginPath();
+                            ctx.roundRect(x - pw / 2, y - ph / 2, pw, ph, 6);
+                            ctx.fill();
+                            ctx.globalAlpha = 0.9;
+                            ctx.fillStyle = '#ffffff';
+                            ctx.fillText(wmLabel, x, y);
+                        }
+                    }
+                    ctx.restore();
+                    ctx.globalAlpha = 1;
+                }
+
+                rafRef.current = requestAnimationFrame(drawFrame);
+            };
+            drawFrame();
+
+            const canvasStream = canvas.captureStream(30);
+
+            // Mix local mic + remote audio
+            const audioCtx = new AudioContext();
+            audioCtxRef.current = audioCtx;
+            const dest = audioCtx.createMediaStreamDestination();
+
+            if (stream) {
+                const localAudio = stream.getAudioTracks();
+                if (localAudio.length > 0) {
+                    audioCtx.createMediaStreamSource(new MediaStream(localAudio)).connect(dest);
+                }
+            }
+            if (remoteStreamRef.current) {
+                const remoteAudio = remoteStreamRef.current.getAudioTracks();
+                if (remoteAudio.length > 0) {
+                    audioCtx.createMediaStreamSource(new MediaStream(remoteAudio)).connect(dest);
+                }
+            }
+
+            return new MediaStream([
+                ...canvasStream.getVideoTracks(),
+                ...dest.stream.getAudioTracks()
+            ]);
+        } catch (_) {
+            return null;
+        }
+    };
+
+    const cleanupMixedStream = () => {
+        cancelAnimationFrame(rafRef.current);
+        audioCtxRef.current?.close().catch(() => {});
+        audioCtxRef.current = null;
+        mixedCanvasRef.current = null;
+        wmControlRef.current = null; // discard closure setter — canvas is gone
+    };
+
+    // ── Screen Sharing ────────────────────────────────────────────────────────
+    const startScreenShareActual = async () => {
+        try {
+            const screenStream = await navigator.mediaDevices.getDisplayMedia({
+                video: true,
+                audio: true
+            });
+            screenShareStreamRef.current = screenStream;
+            const videoTrack = screenStream.getVideoTracks()[0];
+
+            if (screenShareSenderRef.current) {
+                await screenShareSenderRef.current.replaceTrack(videoTrack);
+            }
+            if (localVideoRef.current) localVideoRef.current.srcObject = screenStream;
+
+            setIsScreenSharing(true);
+            sendDataMessage({ type: 'screen-share-start' });
+
+            // User stops sharing via browser native button
+            videoTrack.onended = () => stopScreenShare();
+        } catch (err) {
+            console.error('Screen share failed:', err);
+            setScreenSharePending(false);
+        }
+    };
+
+    const startScreenShare = async () => {
+        if (isScreenSharing) return;
+        if (remoteScreenSharing) {
+            // Someone else is sharing — request host to hand over
+            sendDataMessage({ type: 'screen-share-request', sender: 'Remote Peer' });
+            setScreenSharePending(true);
+            return;
+        }
+        await startScreenShareActual();
+    };
+
+    const stopScreenShare = () => {
+        screenShareStreamRef.current?.getTracks().forEach(t => t.stop());
+        screenShareStreamRef.current = null;
+
+        const cameraTrack = stream?.getVideoTracks()[0];
+        if (cameraTrack && screenShareSenderRef.current) {
+            screenShareSenderRef.current.replaceTrack(cameraTrack).catch(() => {});
+        }
+        if (localVideoRef.current && stream) localVideoRef.current.srcObject = stream;
+
+        setIsScreenSharing(false);
+        sendDataMessage({ type: 'screen-share-stop' });
+    };
+
+    const approveScreenShare = () => {
+        sendDataMessage({ type: 'screen-share-approve' });
+        setScreenShareRequest(null);
+    };
+
+    const denyScreenShare = () => {
+        sendDataMessage({ type: 'screen-share-deny' });
+        setScreenShareRequest(null);
+    };
+
+    // ── In-room Chat ──────────────────────────────────────────────────────────
+    const sendRoomChatMessage = () => {
+        if (!roomChatInput.trim()) return;
+        const msg: InRoomMsg = {
+            id: Date.now().toString(),
+            text: roomChatInput.trim(),
+            sender: 'me',
+            timestamp: Date.now()
+        };
+        if (chatTab === 'group') {
+            setGroupMessages(prev => [...prev, msg]);
+            sendDataMessage({ type: 'group-chat', id: msg.id, text: msg.text, timestamp: msg.timestamp });
+        } else {
+            setPrivateMessages(prev => [...prev, msg]);
+            sendDataMessage({ type: 'private-chat', id: msg.id, text: msg.text, timestamp: msg.timestamp });
+        }
+        setRoomChatInput('');
+    };
+
+    // ── Reactions ─────────────────────────────────────────────────────────────
+    const sendReaction = (key: ReactionKey) => {
+        setReactionVotes(prev => ({ ...prev, [key]: [...prev[key], 'You'] }));
+        addFloatingReaction(REACTION_EMOJIS[key]);
+        sendDataMessage({ type: 'reaction', emoji: key });
+    };
+
+    const totalReactions = Object.values(reactionVotes).reduce((a, b) => a + b.length, 0);
+
+    // ── Save zoom chat sessions to History on call end ─────────────────────────
+    const saveZoomChats = async () => {
+        const dateStr = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        try {
+            if (groupMessages.length > 0) {
+                const msgs: ChatMessage[] = groupMessages.map(m => ({
+                    sender: m.sender === 'me' ? 'user' : 'partner',
+                    text: m.text,
+                    timestamp: m.timestamp,
+                }));
+                await saveChatSession({
+                    id: `zoom-group-${roomId}-${Date.now()}`,
+                    partnerId: roomId,
+                    partnerName: `Group Chat Discussion — Room ${roomId}`,
+                    date: dateStr,
+                    timestamp: Date.now(),
+                    messages: msgs,
+                    size: calculateChatSize(msgs),
+                });
+            }
+            if (privateMessages.length > 0) {
+                const msgs: ChatMessage[] = privateMessages.map(m => ({
+                    sender: m.sender === 'me' ? 'user' : 'partner',
+                    text: m.text,
+                    timestamp: m.timestamp,
+                }));
+                await saveChatSession({
+                    id: `zoom-private-${roomId}-${Date.now()}`,
+                    partnerId: roomId,
+                    partnerName: `Private Chat Discussion — Room ${roomId}`,
+                    date: dateStr,
+                    timestamp: Date.now(),
+                    messages: msgs,
+                    size: calculateChatSize(msgs),
+                });
+            }
+        } catch (err) {
+            console.error('Failed to save zoom chats:', err);
+        }
+    };
+
+    // ── Controls ───────────────────────────────────────────────────────────────
     const toggleMic = () => {
         if (stream) {
-            stream.getAudioTracks().forEach(track => {
-                track.enabled = !track.enabled;
-            });
-            setMicEnabled(!micEnabled);
+            stream.getAudioTracks().forEach(t => { t.enabled = !t.enabled; });
+            setMicEnabled(prev => !prev);
         }
     };
 
     const toggleCamera = () => {
         if (stream) {
-            stream.getVideoTracks().forEach(track => {
-                track.enabled = !track.enabled;
-            });
-            setCameraEnabled(!cameraEnabled);
+            stream.getVideoTracks().forEach(t => { t.enabled = !t.enabled; });
+            setCameraEnabled(prev => !prev);
         }
     };
 
@@ -398,91 +848,57 @@ export default function MeetingRoomPage() {
         if (stream) {
             recordedChunksRef.current = [];
             recordingStartTimeRef.current = Date.now();
-
-            const mediaRecorder = new MediaRecorder(stream, {
-                mimeType: 'video/webm'
-            });
-
-            mediaRecorder.ondataavailable = (event) => {
-                if (event.data.size > 0) {
-                    recordedChunksRef.current.push(event.data);
-                }
+            const MR = REAL_MEDIA_RECORDER || MediaRecorder;
+            const recordingStream = createMixedStream() || stream;
+            const mr = new MR(recordingStream, { mimeType: 'video/webm' });
+            mr.ondataavailable = (event) => {
+                if (event.data.size > 0) recordedChunksRef.current.push(event.data);
             };
-
-            mediaRecorder.onstop = async () => {
+            mr.onstop = async () => {
+                cleanupMixedStream();
                 const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
-                if (blob.size > 0) {
-                    await handleSaveRecording(blob);
-                } else {
-                    console.warn('Recording stopped with empty blob.');
-                    if (isEndingCallRef.current) {
-                        router.push('/search?tab=history');
-                    }
-                }
+                if (blob.size > 0) await handleSaveRecording(blob);
+                else if (isEndingCallRef.current) router.push('/search?tab=history');
             };
-
-            mediaRecorder.start(1000); // Collect data every second
-            mediaRecorderRef.current = mediaRecorder;
+            mr.start(1000);
+            mediaRecorderRef.current = mr;
             setIsRecording(true);
             setRecordingTime(0);
         }
     };
 
     const stopRecording = () => {
-        if (mediaRecorderRef.current && isRecording) {
-            // Request final data if possible
-            if (mediaRecorderRef.current.state === 'recording') {
-                mediaRecorderRef.current.requestData();
-            }
-            mediaRecorderRef.current.stop();
+        const mr = mediaRecorderRef.current;
+        if (mr && (mr.state === 'recording' || mr.state === 'paused')) {
+            mr.requestData();
+            mr.stop();
             setIsRecording(false);
         }
     };
 
-    const [isEndingCall, setIsEndingCall] = useState(false);
-    const isEndingCallRef = useRef(false);
-    const recordingTimeRef = useRef(0);
-
-    // Sync ref with state
-    useEffect(() => {
-        isEndingCallRef.current = isEndingCall;
-    }, [isEndingCall]);
-
-    useEffect(() => {
-        recordingTimeRef.current = recordingTime;
-    }, [recordingTime]);
-
-    // ... existing code ...
-
     const handleSaveRecording = async (blob: Blob) => {
-        // Use Ref for time to ensure we have the latest value even in stale closures
-        const duration = formatTime(recordingTimeRef.current);
-
         const recording: ZoomRecording = {
             id: Date.now().toString(),
             roomId,
             date: new Date().toLocaleString(),
-            duration: duration,
+            duration: formatTime(recordingTimeRef.current),
             size: `${(blob.size / (1024 * 1024)).toFixed(2)} MB`,
             blob,
             timestamp: Date.now()
         };
-
         try {
-            // Save to IndexedDB
             await saveRecording(recording);
             setRecordingSaved(true);
-            console.log('Recording saved to History:', recording.id);
-
-            // Use Ref for ending call check to avoid stale closure issues
             if (isEndingCallRef.current) {
-                setTimeout(() => router.push('/search?tab=history'), 1000); // Small delay to show toast
+                setTimeout(() => router.push('/search?tab=history'), 1000);
             } else {
                 setTimeout(() => setRecordingSaved(false), 3000);
             }
         } catch (err) {
-            console.error('Failed to save recording:', err);
-            // Fallback: trigger download
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error('❌ saveRecording failed, falling back to download:', err);
+            setSaveError(`Save failed: ${msg}. Recording downloaded instead.`);
+            setTimeout(() => setSaveError(null), 8000);
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -491,442 +907,609 @@ export default function MeetingRoomPage() {
             a.click();
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
-
-            if (isEndingCallRef.current) {
-                router.push('/search?tab=history');
-            }
+            if (isEndingCallRef.current) router.push('/search?tab=history');
         }
     };
 
-
-
     const formatTime = (seconds: number) => {
-        const mins = Math.floor(seconds / 60);
-        const secs = seconds % 60;
-        return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+        const m = Math.floor(seconds / 60).toString().padStart(2, '0');
+        const s = (seconds % 60).toString().padStart(2, '0');
+        return `${m}:${s}`;
     };
 
     const copyInviteLink = () => {
-        const link = `${window.location.origin}/zoom/${roomId}`;
-        navigator.clipboard.writeText(link);
+        navigator.clipboard.writeText(`${window.location.origin}/zoom/${roomId}`);
         setLinkCopied(true);
         setTimeout(() => setLinkCopied(false), 2000);
     };
 
-    const endCall = () => {
-        if (stream) {
-            stream.getTracks().forEach(track => track.stop());
+    const endCall = async () => {
+        // 1. Stop recording first (while stream is alive)
+        const wasRecording = isRecording || (mediaRecorderRef.current?.state === 'recording');
+        if (wasRecording) {
+            setIsEndingCall(true);
+            isEndingCallRef.current = true;
+            stopRecording();
         }
 
-        if (isRecording) {
-            setIsEndingCall(true);
-            isEndingCallRef.current = true; // Immediate ref update for safety
-            stopRecording();
+        // 2. Save zoom chats to History
+        await saveZoomChats();
 
-            // Failsafe: Force navigation after 3 seconds if saving hangs/fails
+        // 3. Stop screen share
+        if (isScreenSharing) stopScreenShare();
+
+        // 4. Stop stream tracks (small delay so MediaRecorder can finish)
+        setTimeout(() => {
+            stream?.getTracks().forEach(t => t.stop());
+        }, 400);
+
+        // 5. Close WebRTC
+        if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
+        if (webrtcIntervalRef.current) clearInterval(webrtcIntervalRef.current);
+        dataChannelRef.current?.close();
+        fetch(`/api/zoom/signal?roomId=${roomId}`, { method: 'DELETE' }).catch(() => {});
+
+        if (!wasRecording) {
+            router.push('/search?tab=history');
+        } else {
             setTimeout(() => {
                 if (window.location.pathname.includes('/zoom/')) {
-                    console.warn('End call timeout reached - forcing navigation');
                     router.push('/search?tab=history');
                 }
-            }, 3000);
-        } else {
-            router.push('/search?tab=history');
+            }, 6000);
         }
     };
 
+    const participantCount = connectionState === 'connected' ? 2 : 1;
+    const activeMessages = chatTab === 'group' ? groupMessages : chatTab === 'private' ? privateMessages : [];
+
+    // ── Render ─────────────────────────────────────────────────────────────────
     return (
         <div className="min-h-screen bg-[#0a0a0f] text-white font-sans flex flex-col">
             <GlobalNavbar />
 
-            {/* DRM Protection Overlay - AGGRESSIVE */}
+            {/* DRM Overlay */}
             <AnimatePresence>
                 {showDRMOverlay && drmEnabled && (
                     <motion.div
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        exit={{ opacity: 0 }}
-                        className="fixed inset-0 z-[200] bg-black flex items-center justify-center"
-                        style={{
-                            background: 'repeating-linear-gradient(45deg, #000 0px, #000 10px, #111 10px, #111 20px)',
-                            animation: 'flash 0.2s ease-in-out 3'
-                        }}
+                        initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+                        className="fixed inset-0 z-[200] flex items-center justify-center"
+                        style={{ background: 'repeating-linear-gradient(45deg, #000 0px, #000 10px, #111 10px, #111 20px)' }}
                     >
                         <div className="text-center p-8 bg-black/90 rounded-3xl border-4 border-red-600 shadow-2xl shadow-red-600/50">
-                            <div className="mb-6 relative">
-                                <Shield className="w-24 h-24 text-red-600 mx-auto animate-pulse" />
-                                <div className="absolute inset-0 flex items-center justify-center">
-                                    <div className="w-32 h-32 border-4 border-red-600 rounded-full animate-ping opacity-30" />
-                                </div>
-                            </div>
-                            <h2 className="text-4xl font-black mb-4 text-red-500 uppercase tracking-wider">
-                                🚫 SCREENSHOT BLOCKED
-                            </h2>
-                            <p className="text-xl text-white font-medium mb-4">
-                                This content is DRM protected
-                            </p>
-                            <p className="text-gray-400 max-w-md mx-auto text-sm">
-                                Screen capture, recording, and screenshots are not permitted.
-                                Any attempt will result in a black screen capture.
-                            </p>
+                            <Shield className="w-20 h-20 text-red-600 mx-auto mb-4" />
+                            <h2 className="text-3xl font-black text-red-500 mb-2">DRM PROTECTION ACTIVE</h2>
+                            <p className="text-gray-400 max-w-sm">Screenshots, screen recording, DevTools, and clipboard capture are not permitted.</p>
                             <div className="mt-6 flex items-center justify-center gap-2 text-yellow-500">
                                 <AlertTriangle className="w-5 h-5" />
-                                <span className="text-sm font-medium">Violation logged • Session protected</span>
+                                <span className="text-sm font-medium">Violation logged • {sessionFingerprint}</span>
                             </div>
                         </div>
                     </motion.div>
                 )}
             </AnimatePresence>
 
-            {/* Recording Saved Toast */}
+            {/* Toasts */}
             <AnimatePresence>
                 {recordingSaved && (
-                    <motion.div
-                        initial={{ opacity: 0, y: -50 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: -50 }}
-                        className="fixed top-24 left-1/2 -translate-x-1/2 z-[100] bg-green-600/90 backdrop-blur-sm px-6 py-3 rounded-xl flex items-center gap-3 shadow-lg"
-                    >
-                        <Check className="w-5 h-5" />
-                        <span className="font-medium">Recording saved to History!</span>
+                    <motion.div initial={{ opacity: 0, y: -50 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -50 }}
+                        className="fixed top-24 left-1/2 -translate-x-1/2 z-[100] bg-green-600/90 backdrop-blur-sm px-6 py-3 rounded-xl flex items-center gap-3 shadow-lg">
+                        <Check className="w-5 h-5" /><span className="font-medium">Recording saved to History!</span>
                     </motion.div>
                 )}
             </AnimatePresence>
-
-            {/* Auto-Recording Started Notification */}
+            <AnimatePresence>
+                {saveError && (
+                    <motion.div initial={{ opacity: 0, y: -50 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -50 }}
+                        className="fixed top-24 left-1/2 -translate-x-1/2 z-[100] bg-red-600/90 backdrop-blur-sm px-6 py-3 rounded-xl flex items-center gap-3 shadow-lg max-w-lg">
+                        <AlertTriangle className="w-5 h-5 shrink-0" /><span className="font-medium text-sm">{saveError}</span>
+                    </motion.div>
+                )}
+            </AnimatePresence>
             <AnimatePresence>
                 {autoRecordingStarted && isRecording && recordingTime < 5 && (
-                    <motion.div
-                        initial={{ opacity: 0, y: 50 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: 50 }}
-                        className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[100] bg-purple-600/90 backdrop-blur-sm px-6 py-3 rounded-xl flex items-center gap-3 shadow-lg border border-purple-400/30"
-                    >
+                    <motion.div initial={{ opacity: 0, y: 50 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 50 }}
+                        className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[100] bg-purple-600/90 backdrop-blur-sm px-6 py-3 rounded-xl flex items-center gap-3 shadow-lg border border-purple-400/30">
                         <Circle className="w-4 h-4 fill-red-500 animate-pulse" />
-                        <span className="font-medium">🎬 Auto-Recording started! Your meeting will be saved to History.</span>
+                        <span className="font-medium">🎬 Auto-Recording — both participants captured. Saved to History when call ends.</span>
                     </motion.div>
                 )}
             </AnimatePresence>
 
-            {/* Main Video Area */}
-            <main className="flex-1 flex flex-col p-4">
-                {/* Room Info Bar */}
-                <div className="flex items-center justify-between mb-4 px-2">
-                    <div className="flex items-center gap-4">
-                        <div className="flex items-center gap-2 bg-white/5 px-4 py-2 rounded-lg border border-white/10">
-                            <span className="text-sm text-gray-400">Room:</span>
-                            <span className="font-mono font-bold tracking-widest">{roomId}</span>
+            {/* Screen Share Request (host sees) */}
+            <AnimatePresence>
+                {screenShareRequest && (
+                    <motion.div initial={{ opacity: 0, x: 100 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 100 }}
+                        className="fixed top-24 right-6 z-[110] bg-[#1a1a2e] border border-purple-500/40 rounded-2xl p-4 shadow-2xl w-72">
+                        <div className="flex items-center gap-2 mb-2">
+                            <Monitor className="w-4 h-4 text-purple-400" />
+                            <p className="text-sm font-semibold">Screen Share Request</p>
                         </div>
-                        <div className="flex items-center gap-2 text-sm text-gray-400">
-                            <Users className="w-4 h-4" />
-                            {participants.length} participants
+                        <p className="text-xs text-gray-400 mb-3">{screenShareRequest} wants to share their screen</p>
+                        <div className="flex gap-2">
+                            <button onClick={approveScreenShare} className="flex-1 py-2 bg-green-600/20 text-green-400 rounded-lg text-sm hover:bg-green-600/30 border border-green-500/20 transition-colors">✓ Allow</button>
+                            <button onClick={denyScreenShare} className="flex-1 py-2 bg-red-600/20 text-red-400 rounded-lg text-sm hover:bg-red-600/30 border border-red-500/20 transition-colors">✕ Deny</button>
                         </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                        {isRecording && (
-                            <motion.div
-                                initial={{ opacity: 0, scale: 0.9 }}
-                                animate={{ opacity: 1, scale: 1 }}
-                                className="flex items-center gap-2 bg-red-600/20 text-red-400 px-3 py-1.5 rounded-full border border-red-500/30"
-                            >
-                                <Circle className="w-3 h-3 fill-red-500 animate-pulse" />
-                                <span className="text-sm font-medium">
-                                    {autoRecordingStarted && <span className="text-red-300 mr-1">AUTO</span>}
-                                    REC {formatTime(recordingTime)}
-                                </span>
-                            </motion.div>
-                        )}
-                        {drmEnabled && (
-                            <div className="flex items-center gap-2">
-                                <div className="flex items-center gap-2 bg-purple-600/20 text-purple-400 px-3 py-1.5 rounded-full border border-purple-500/30">
-                                    <Shield className="w-4 h-4" />
-                                    <span className="text-xs font-medium">
-                                        {advancedDRMActive ? 'DRM+' : 'DRM'}
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
+            {/* Floating Reactions */}
+            <div className="fixed inset-0 pointer-events-none z-[90] overflow-hidden">
+                {floatingReactions.map(r => (
+                    <motion.div key={r.id}
+                        initial={{ y: '88vh', opacity: 1, scale: 1 }}
+                        animate={{ y: '-5vh', opacity: 0, scale: 1.6 }}
+                        transition={{ duration: 3, ease: 'easeOut' }}
+                        className="absolute text-3xl select-none"
+                        style={{ left: `${r.x}%` }}>
+                        {r.emoji}
+                    </motion.div>
+                ))}
+            </div>
+
+            {/* Main: video area + chat panel */}
+            <div className="flex-1 flex overflow-hidden">
+
+                {/* Video + Controls */}
+                <main className="flex-1 flex flex-col p-4 min-w-0">
+
+                    {/* Room Info Bar */}
+                    <div className="flex items-center justify-between mb-4 px-2">
+                        <div className="flex items-center gap-4">
+                            <div className="flex items-center gap-2 bg-white/5 px-4 py-2 rounded-lg border border-white/10">
+                                <span className="text-sm text-gray-400">Room:</span>
+                                <span className="font-mono font-bold tracking-widest">{roomId}</span>
+                            </div>
+                            <div className="flex items-center gap-2 text-sm text-gray-400">
+                                <Users className="w-4 h-4" />
+                                {participantCount} participant{participantCount > 1 ? 's' : ''}
+                            </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                            {isRecording && (
+                                <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }}
+                                    className="flex items-center gap-2 bg-red-600/20 text-red-400 px-3 py-1.5 rounded-full border border-red-500/30">
+                                    <Circle className="w-3 h-3 fill-red-500 animate-pulse" />
+                                    <span className="text-sm font-medium">
+                                        {autoRecordingStarted && <span className="text-red-300 mr-1">AUTO</span>}
+                                        REC {formatTime(recordingTime)}
                                     </span>
-                                </div>
-                                {sessionFingerprint && (
-                                    <div className="flex items-center gap-1 bg-blue-600/20 text-blue-400 px-2 py-1 rounded-full border border-blue-500/30 text-xs">
-                                        <span className="font-mono">{sessionFingerprint}</span>
+                                </motion.div>
+                            )}
+                            {drmEnabled && (
+                                <div className="flex items-center gap-2">
+                                    <div className="flex items-center gap-2 bg-purple-600/20 text-purple-400 px-3 py-1.5 rounded-full border border-purple-500/30">
+                                        <Shield className="w-4 h-4" />
+                                        <span className="text-xs font-medium">{advancedDRMActive ? 'DRM+' : 'DRM'}</span>
                                     </div>
-                                )}
-                                {drmViolationCount > 0 && (
-                                    <div className="flex items-center gap-1 bg-red-600/30 text-red-400 px-2 py-1 rounded-full border border-red-500/30 text-xs animate-pulse">
-                                        <AlertTriangle className="w-3 h-3" />
-                                        <span>{drmViolationCount} violations</span>
-                                    </div>
-                                )}
-                            </div>
-                        )}
-                    </div>
-                </div>
-
-                {/* Video Grid */}
-                <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
-                    {/* Local Video (You) - DRM Protected */}
-                    <div
-                        ref={videoContainerRef}
-                        className={`relative bg-[#111] rounded-2xl overflow-hidden border border-white/5 ${drmEnabled && drmSettings.screenshotBlocking ? 'drm-video-protected' : ''} ${drmEnabled && drmSettings.screenRecordingBlock ? 'screen-recording-blocked' : ''}`}
-                    >
-                        {cameraEnabled ? (
-                            <video
-                                ref={videoRef}
-                                autoPlay
-                                playsInline
-                                muted
-                                className="w-full h-full object-cover min-h-[300px]"
-                                style={drmEnabled && drmSettings.screenshotBlocking ? {
-                                    // Netflix-style: Make video unselectable and harder to capture
-                                    WebkitUserSelect: 'none',
-                                    userSelect: 'none',
-                                    pointerEvents: 'none',
-                                } : {}}
-                            />
-                        ) : (
-                            <div className="w-full h-full min-h-[300px] flex items-center justify-center bg-gradient-to-br from-gray-800 to-gray-900">
-                                <div className="w-24 h-24 rounded-full bg-blue-600 flex items-center justify-center text-3xl font-bold">
-                                    Y
+                                    {sessionFingerprint && (
+                                        <div className="bg-blue-600/20 text-blue-400 px-2 py-1 rounded-full border border-blue-500/30 text-xs font-mono">
+                                            {sessionFingerprint}
+                                        </div>
+                                    )}
+                                    {drmViolationCount > 0 && (
+                                        <div className="flex items-center gap-1 bg-red-600/30 text-red-400 px-2 py-1 rounded-full border border-red-500/30 text-xs animate-pulse">
+                                            <AlertTriangle className="w-3 h-3" />
+                                            <span>{drmViolationCount} violation{drmViolationCount > 1 ? 's' : ''}</span>
+                                        </div>
+                                    )}
                                 </div>
-                            </div>
-                        )}
-                        <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-sm px-3 py-1 rounded-lg text-sm">
-                            You {!micEnabled && '(muted)'}
+                            )}
                         </div>
+                    </div>
 
-                        {/* VISIBLE WATERMARK - Only when watermarkOverlay is enabled */}
-                        {drmEnabled && drmSettings.watermarkOverlay && (
-                            <div className="absolute inset-0 pointer-events-none flex items-center justify-center overflow-hidden">
-                                {/* Diagonal repeating watermark */}
-                                <div className="absolute inset-0" style={{
-                                    background: 'repeating-linear-gradient(45deg, transparent, transparent 50px, rgba(255,0,0,0.03) 50px, rgba(255,0,0,0.03) 100px)',
-                                }}>
-                                    {/* Multiple watermark texts */}
-                                    {[...Array(5)].map((_, i) => (
-                                        <div
-                                            key={i}
-                                            className="absolute text-red-500/10 font-black text-2xl uppercase tracking-widest select-none"
-                                            style={{
-                                                transform: `rotate(-30deg) translate(${i * 150 - 200}px, ${i * 80}px)`,
-                                                whiteSpace: 'nowrap'
-                                            }}
-                                        >
-                                            🔒 PROTECTED • DRM SECURED • 🔒 PROTECTED • DRM SECURED
+                    {/* Video Grid */}
+                    <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+
+                        {/* Local Video */}
+                        <div ref={videoContainerRef}
+                            className={`relative bg-[#111] rounded-2xl overflow-hidden border border-white/5
+                                ${drmEnabled && drmSettings.screenshotBlocking ? 'drm-video-protected' : ''}
+                                ${drmEnabled && drmSettings.screenRecordingBlock ? 'screen-recording-blocked' : ''}`}>
+                            {cameraEnabled || isScreenSharing ? (
+                                <video ref={localVideoRef} autoPlay playsInline muted
+                                    className="w-full h-full object-cover min-h-[300px]"
+                                    style={drmEnabled && drmSettings.screenshotBlocking ? { WebkitUserSelect: 'none', userSelect: 'none', pointerEvents: 'none' } : {}} />
+                            ) : (
+                                <div className="w-full h-full min-h-[300px] flex items-center justify-center bg-gradient-to-br from-gray-800 to-gray-900">
+                                    <div className="w-24 h-24 rounded-full bg-blue-600 flex items-center justify-center text-3xl font-bold">Y</div>
+                                </div>
+                            )}
+                            <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-sm px-3 py-1 rounded-lg text-sm">
+                                {isScreenSharing ? '🖥️ You (Screen Share)' : `You${!micEnabled ? ' (muted)' : ''}`}
+                            </div>
+                            {isScreenSharing && (
+                                <div className="absolute top-3 right-3 bg-blue-600/80 text-white text-xs px-2 py-1 rounded-full flex items-center gap-1">
+                                    <Monitor className="w-3 h-3" /> Sharing
+                                </div>
+                            )}
+                            {drmSettings.watermarkOverlay && (
+                                <div className="absolute inset-0 pointer-events-none" style={{ zIndex: 10 }}>
+                                    {([
+                                        [15, 10], [50, 10], [85, 10],
+                                        [15, 45], [50, 45], [85, 45],
+                                        [15, 80], [50, 80], [85, 80],
+                                    ] as [number, number][]).map(([left, top], i) => (
+                                        <div key={i} style={{
+                                            position: 'absolute',
+                                            left: `${left}%`,
+                                            top: `${top}%`,
+                                            transform: 'translate(-50%, -50%) rotate(-30deg)',
+                                            color: 'rgba(255,255,255,0.9)',
+                                            fontSize: '13px',
+                                            fontWeight: 'bold',
+                                            fontFamily: 'monospace',
+                                            whiteSpace: 'nowrap',
+                                            userSelect: 'none',
+                                            backgroundColor: 'rgba(0,0,0,0.72)',
+                                            borderRadius: '4px',
+                                            padding: '3px 8px',
+                                        }}>
+                                            🔒 {sessionFingerprint || roomId} • PROTECTED
                                         </div>
                                     ))}
                                 </div>
-                                {/* Center shield icon */}
-                                <div className="absolute inset-0 flex items-center justify-center">
-                                    <Shield className="w-32 h-32 text-white/5" />
+                            )}
+                        </div>
+
+                        {/* Remote Video */}
+                        <div className="relative bg-[#111] rounded-2xl overflow-hidden border border-white/5">
+                            <video ref={remoteVideoRef} autoPlay playsInline
+                                className={`w-full h-full object-cover min-h-[300px] ${connectionState === 'connected' ? 'block' : 'hidden'}`} />
+                            {connectionState !== 'connected' && (
+                                <div className="w-full h-full min-h-[300px] flex items-center justify-center bg-gradient-to-br from-gray-900 to-[#0a0a0f]">
+                                    <div className="text-center px-6">
+                                        {connectionState === 'waiting' && (<>
+                                            <div className="w-20 h-20 rounded-full bg-purple-900/50 border-2 border-purple-500/30 flex items-center justify-center mx-auto mb-4">
+                                                <Users className="w-9 h-9 text-purple-400" />
+                                            </div>
+                                            <p className="text-gray-300 font-medium mb-1">Waiting for peer to join...</p>
+                                            <p className="text-gray-600 text-xs mb-4">Share the room code or invite link</p>
+                                            <button onClick={() => setShowInviteModal(true)}
+                                                className="px-4 py-2 bg-purple-600/20 border border-purple-500/30 text-purple-400 text-sm rounded-lg hover:bg-purple-600/30 transition-all">
+                                                📋 Copy Invite Link
+                                            </button>
+                                        </>)}
+                                        {connectionState === 'connecting' && (<>
+                                            <div className="w-20 h-20 rounded-full bg-blue-900/50 border-2 border-blue-500/30 flex items-center justify-center mx-auto mb-4">
+                                                <Loader2 className="w-9 h-9 text-blue-400 animate-spin" />
+                                            </div>
+                                            <p className="text-blue-300 font-medium mb-1">Connecting...</p>
+                                            <p className="text-gray-600 text-xs">Establishing secure WebRTC connection</p>
+                                        </>)}
+                                        {connectionState === 'disconnected' && (<>
+                                            <div className="w-20 h-20 rounded-full bg-red-900/50 border-2 border-red-500/30 flex items-center justify-center mx-auto mb-4">
+                                                <AlertTriangle className="w-9 h-9 text-red-400" />
+                                            </div>
+                                            <p className="text-red-400 font-medium">Peer disconnected</p>
+                                        </>)}
+                                    </div>
                                 </div>
+                            )}
+                            <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-sm px-3 py-1 rounded-lg text-sm">
+                                {connectionState === 'connected'
+                                    ? remoteScreenSharing ? '🖥️ Remote (Screen Share)' : 'Remote Peer'
+                                    : connectionState === 'connecting' ? 'Connecting...'
+                                    : connectionState === 'disconnected' ? 'Disconnected'
+                                    : 'Waiting for peer'}
                             </div>
+                            <div className="absolute top-4 right-4">
+                                <div className={`w-3 h-3 rounded-full ${
+                                    connectionState === 'connected' ? 'bg-green-500 animate-pulse'
+                                    : connectionState === 'connecting' ? 'bg-yellow-500 animate-pulse'
+                                    : connectionState === 'disconnected' ? 'bg-red-500' : 'bg-gray-500'}`} />
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Reactions Poll (collapsible) */}
+                    {totalReactions > 0 && (
+                        <button onClick={() => setShowReactionPoll(p => !p)}
+                            className="mb-3 w-full flex items-center justify-between px-4 py-2 bg-white/5 rounded-xl border border-white/10 hover:bg-white/10 transition-colors text-sm text-gray-300">
+                            <div className="flex items-center gap-2">
+                                <BarChart2 className="w-4 h-4" /> Reactions Poll ({totalReactions} total)
+                            </div>
+                            <ChevronDown className={`w-4 h-4 transition-transform ${showReactionPoll ? 'rotate-180' : ''}`} />
+                        </button>
+                    )}
+                    <AnimatePresence>
+                        {showReactionPoll && totalReactions > 0 && (
+                            <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }}
+                                className="mb-3 overflow-hidden bg-[#111] rounded-xl border border-white/10 p-4">
+                                <div className="grid grid-cols-3 sm:grid-cols-6 gap-3">
+                                    {(Object.entries(reactionVotes) as [ReactionKey, string[]][]).map(([key, voters]) => (
+                                        <div key={key} className="flex flex-col items-center gap-1">
+                                            <span className="text-xl">{REACTION_EMOJIS[key]}</span>
+                                            <div className="w-full bg-white/10 rounded-full h-1.5">
+                                                <div className="bg-purple-500 h-1.5 rounded-full transition-all duration-500"
+                                                    style={{ width: totalReactions > 0 ? `${(voters.length / totalReactions) * 100}%` : '0%' }} />
+                                            </div>
+                                            <span className="text-xs text-gray-400 font-bold">{voters.length}</span>
+                                            <span className="text-xs text-gray-600">{REACTION_LABELS[key]}</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            </motion.div>
                         )}
+                    </AnimatePresence>
+
+                    {/* Controls Bar */}
+                    <div className="flex items-center justify-center gap-3 py-4 bg-[#111] rounded-2xl border border-white/5 flex-wrap px-4">
+                        <button onClick={toggleMic}
+                            className={`p-4 rounded-full transition-all ${micEnabled ? 'bg-white/10 hover:bg-white/20' : 'bg-red-600 hover:bg-red-700'}`}
+                            title={micEnabled ? 'Mute' : 'Unmute'}>
+                            {micEnabled ? <Mic className="w-6 h-6" /> : <MicOff className="w-6 h-6" />}
+                        </button>
+
+                        <button onClick={toggleCamera}
+                            className={`p-4 rounded-full transition-all ${cameraEnabled ? 'bg-white/10 hover:bg-white/20' : 'bg-red-600 hover:bg-red-700'}`}
+                            title={cameraEnabled ? 'Turn off camera' : 'Turn on camera'}>
+                            {cameraEnabled ? <Camera className="w-6 h-6" /> : <CameraOff className="w-6 h-6" />}
+                        </button>
+
+                        {/* Screen Share */}
+                        <button onClick={isScreenSharing ? stopScreenShare : startScreenShare}
+                            className={`p-4 rounded-full transition-all ${
+                                isScreenSharing ? 'bg-blue-600 hover:bg-blue-700'
+                                : screenSharePending ? 'bg-yellow-600 animate-pulse'
+                                : 'bg-white/10 hover:bg-white/20'}`}
+                            title={isScreenSharing ? 'Stop Screen Share' : screenSharePending ? 'Waiting for host approval…' : 'Share Screen'}>
+                            {isScreenSharing ? <MonitorOff className="w-6 h-6" /> : <Monitor className="w-6 h-6" />}
+                        </button>
+
+                        {/* Record */}
+                        <button onClick={isRecording ? stopRecording : startRecording}
+                            className={`p-4 rounded-full transition-all ${isRecording ? 'bg-red-600 hover:bg-red-700 animate-pulse' : 'bg-white/10 hover:bg-white/20'}`}
+                            title={isRecording ? 'Stop Recording' : 'Start Recording'}>
+                            {isRecording ? <Square className="w-6 h-6 fill-white" /> : <Circle className="w-6 h-6" />}
+                        </button>
+
+                        {/* Chat */}
+                        <button onClick={() => setShowChatPanel(p => !p)}
+                            className={`p-4 rounded-full transition-all relative ${showChatPanel ? 'bg-purple-600 hover:bg-purple-700' : 'bg-white/10 hover:bg-white/20'}`}
+                            title="Chat">
+                            <MessageSquare className="w-6 h-6" />
+                            {unreadCount > 0 && !showChatPanel && (
+                                <span className="absolute top-1 right-1 bg-red-500 text-white text-xs w-5 h-5 rounded-full flex items-center justify-center font-bold">
+                                    {unreadCount > 9 ? '9+' : unreadCount}
+                                </span>
+                            )}
+                        </button>
+
+                        {/* Reactions — popup above button */}
+                        <div className="relative">
+                            <button onClick={() => setShowReactionBar(p => !p)}
+                                className={`p-4 rounded-full transition-all ${showReactionBar ? 'bg-yellow-600 hover:bg-yellow-700' : 'bg-white/10 hover:bg-white/20'}`}
+                                title="Reactions">
+                                <Heart className="w-6 h-6" />
+                            </button>
+
+                            <AnimatePresence>
+                                {showReactionBar && (
+                                    <motion.div
+                                        initial={{ opacity: 0, y: 8, scale: 0.95 }}
+                                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                                        exit={{ opacity: 0, y: 8, scale: 0.95 }}
+                                        transition={{ duration: 0.15 }}
+                                        className="absolute bottom-full left-1/2 -translate-x-1/2 mb-3 z-50 bg-[#1a1a2e] border border-white/10 rounded-2xl shadow-2xl p-3 w-72"
+                                    >
+                                        {/* Caret pointer */}
+                                        <div className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-[#1a1a2e] border-r border-b border-white/10 rotate-45" />
+
+                                        {/* Header */}
+                                        <div className="flex items-center justify-between mb-2 px-1">
+                                            <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Send a reaction</span>
+                                            <button onClick={() => setShowReactionBar(false)} className="text-gray-600 hover:text-gray-300 transition-colors p-0.5">
+                                                <X className="w-3.5 h-3.5" />
+                                            </button>
+                                        </div>
+
+                                        {/* 3-column emoji grid */}
+                                        <div className="grid grid-cols-3 gap-1">
+                                            {(Object.entries(REACTION_EMOJIS) as [ReactionKey, string][]).map(([key, emoji]) => (
+                                                <button key={key}
+                                                    onClick={() => { sendReaction(key); setShowReactionBar(false); }}
+                                                    className="flex flex-col items-center gap-1 px-2 py-2.5 rounded-xl hover:bg-white/10 active:bg-white/20 transition-colors group"
+                                                    title={REACTION_LABELS[key]}>
+                                                    <span className="text-2xl group-hover:scale-125 transition-transform inline-block leading-none">{emoji}</span>
+                                                    <span className="text-xs text-gray-400 leading-none">{REACTION_LABELS[key]}</span>
+                                                    {reactionVotes[key].length > 0 && (
+                                                        <span className="text-xs font-bold text-yellow-400 leading-none">{reactionVotes[key].length}</span>
+                                                    )}
+                                                </button>
+                                            ))}
+                                        </div>
+
+                                        {/* View Poll shortcut */}
+                                        <div className="mt-2 pt-2 border-t border-white/10">
+                                            <button onClick={() => { setShowReactionPoll(p => !p); setShowReactionBar(false); }}
+                                                className="w-full flex items-center justify-center gap-2 py-2 rounded-xl hover:bg-white/10 transition-colors text-purple-400 text-sm font-medium">
+                                                <BarChart2 className="w-4 h-4" />
+                                                View Poll {totalReactions > 0 && `(${totalReactions} total)`}
+                                            </button>
+                                        </div>
+                                    </motion.div>
+                                )}
+                            </AnimatePresence>
+                        </div>
+
+                        {/* Invite */}
+                        <button onClick={() => setShowInviteModal(true)}
+                            className="p-4 rounded-full bg-white/10 hover:bg-white/20 transition-all" title="Invite">
+                            <Share2 className="w-6 h-6" />
+                        </button>
+
+                        {/* End Call */}
+                        <button onClick={endCall}
+                            className="px-8 py-4 rounded-full bg-red-600 hover:bg-red-700 transition-all" title="End Call">
+                            <PhoneOff className="w-6 h-6" />
+                        </button>
                     </div>
 
-                    {/* Remote Video (Simulated) */}
-                    <div className="relative bg-[#111] rounded-2xl overflow-hidden border border-white/5">
-                        <div className="w-full h-full min-h-[300px] flex items-center justify-center bg-gradient-to-br from-gray-800 to-gray-900">
-                            <div className="text-center">
-                                <div className="w-24 h-24 rounded-full bg-purple-600 flex items-center justify-center text-3xl font-bold mx-auto mb-4">
-                                    G
+                </main>
+
+                {/* Chat Side Panel */}
+                <AnimatePresence>
+                    {showChatPanel && (
+                        <motion.aside
+                            initial={{ width: 0, opacity: 0 }} animate={{ width: 340, opacity: 1 }} exit={{ width: 0, opacity: 0 }}
+                            transition={{ duration: 0.2 }}
+                            className="bg-[#111] border-l border-white/10 flex flex-col overflow-hidden shrink-0">
+                            {/* Header */}
+                            <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
+                                <div className="flex gap-1 bg-black/30 rounded-lg p-1">
+                                    <button onClick={() => setChatTab('group')}
+                                        className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${chatTab === 'group' ? 'bg-purple-600 text-white' : 'text-gray-400 hover:text-white'}`}>
+                                        👥 Group
+                                    </button>
+                                    <button onClick={() => setChatTab('private')}
+                                        className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${chatTab === 'private' ? 'bg-purple-600 text-white' : 'text-gray-400 hover:text-white'}`}>
+                                        🔒 Private
+                                    </button>
+                                    <button onClick={() => setChatTab('poll')}
+                                        className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors flex items-center gap-1 ${chatTab === 'poll' ? 'bg-purple-600 text-white' : 'text-gray-400 hover:text-white'}`}>
+                                        📊 Poll
+                                        {totalReactions > 0 && (
+                                            <span className="text-xs bg-yellow-500/20 text-yellow-400 rounded px-1 leading-none py-0.5">{totalReactions}</span>
+                                        )}
+                                    </button>
                                 </div>
-                                <p className="text-gray-400">Waiting for others to join...</p>
+                                <button onClick={() => setShowChatPanel(false)} className="text-gray-500 hover:text-white transition-colors p-1">
+                                    <X className="w-5 h-5" />
+                                </button>
                             </div>
-                        </div>
-                        <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-sm px-3 py-1 rounded-lg text-sm">
-                            Guest User
-                        </div>
-                    </div>
-                </div>
 
-                {/* Controls Bar */}
-                <div className="flex items-center justify-center gap-4 py-4 bg-[#111] rounded-2xl border border-white/5">
-                    <button
-                        onClick={toggleMic}
-                        className={`p-4 rounded-full transition-all ${micEnabled ? 'bg-white/10 hover:bg-white/20 text-white' : 'bg-red-600 hover:bg-red-700 text-white'}`}
-                        title={micEnabled ? 'Mute' : 'Unmute'}
-                    >
-                        {micEnabled ? <Mic className="w-6 h-6" /> : <MicOff className="w-6 h-6" />}
-                    </button>
+                            {/* Messages / Poll */}
+                            <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                                {chatTab === 'poll' ? (
+                                    totalReactions === 0 ? (
+                                        <div className="text-center text-gray-600 text-sm py-8">
+                                            <BarChart2 className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                                            <p>No reactions yet.</p>
+                                            <p className="text-xs mt-1 text-gray-700">Send a reaction to see results here.</p>
+                                        </div>
+                                    ) : (
+                                        <div className="space-y-3">
+                                            {(Object.entries(reactionVotes) as [ReactionKey, string[]][])
+                                                .filter(([, voters]) => voters.length > 0)
+                                                .sort(([, a], [, b]) => b.length - a.length)
+                                                .map(([key, voters]) => (
+                                                    <div key={key} className="bg-white/5 rounded-xl p-3 border border-white/10">
+                                                        {/* Emoji + label + count */}
+                                                        <div className="flex items-center justify-between mb-2">
+                                                            <div className="flex items-center gap-2">
+                                                                <span className="text-xl leading-none">{REACTION_EMOJIS[key]}</span>
+                                                                <span className="text-sm font-medium text-gray-300">{REACTION_LABELS[key]}</span>
+                                                            </div>
+                                                            <span className="text-sm font-bold text-yellow-400">{voters.length}</span>
+                                                        </div>
+                                                        {/* Progress bar */}
+                                                        <div className="w-full bg-white/10 rounded-full h-2 mb-2.5">
+                                                            <div className="bg-purple-500 h-2 rounded-full transition-all duration-500"
+                                                                style={{ width: `${(voters.length / totalReactions) * 100}%` }} />
+                                                        </div>
+                                                        {/* Who voted — chips */}
+                                                        <div className="flex flex-wrap gap-1">
+                                                            {voters.map((name, i) => (
+                                                                <span key={i}
+                                                                    className={`text-xs px-2 py-0.5 rounded-full border font-medium ${
+                                                                        name === 'You'
+                                                                            ? 'bg-purple-500/20 text-purple-300 border-purple-500/30'
+                                                                            : 'bg-blue-500/20 text-blue-300 border-blue-500/30'
+                                                                    }`}>
+                                                                    {name}
+                                                                </span>
+                                                            ))}
+                                                        </div>
+                                                    </div>
+                                                ))}
+                                        </div>
+                                    )
+                                ) : (
+                                    activeMessages.length === 0 ? (
+                                        <div className="text-center text-gray-600 text-sm py-8">
+                                            <MessageSquare className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                                            <p>No messages yet.</p>
+                                            <p className="text-xs mt-1 text-gray-700">
+                                                {chatTab === 'group' ? 'Visible to all participants' : 'Only this peer sees it'}
+                                            </p>
+                                        </div>
+                                    ) : activeMessages.map(msg => (
+                                        <div key={msg.id} className={`flex ${msg.sender === 'me' ? 'justify-end' : 'justify-start'}`}>
+                                            <div className={`max-w-[80%] px-3 py-2 rounded-2xl text-sm ${
+                                                msg.sender === 'me' ? 'bg-purple-600 text-white rounded-tr-sm' : 'bg-white/10 text-gray-200 rounded-tl-sm'}`}>
+                                                <p className="break-words">{msg.text}</p>
+                                                <p className="text-xs opacity-50 mt-1 text-right">
+                                                    {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                                </p>
+                                            </div>
+                                        </div>
+                                    ))
+                                )}
+                                <div ref={chatEndRef} />
+                            </div>
 
-                    <button
-                        onClick={toggleCamera}
-                        className={`p-4 rounded-full transition-all ${cameraEnabled ? 'bg-white/10 hover:bg-white/20 text-white' : 'bg-red-600 hover:bg-red-700 text-white'}`}
-                        title={cameraEnabled ? 'Turn off camera' : 'Turn on camera'}
-                    >
-                        {cameraEnabled ? <Camera className="w-6 h-6" /> : <CameraOff className="w-6 h-6" />}
-                    </button>
-
-                    <button
-                        onClick={isRecording ? stopRecording : startRecording}
-                        className={`p-4 rounded-full transition-all ${isRecording ? 'bg-red-600 hover:bg-red-700 text-white animate-pulse' : 'bg-white/10 hover:bg-white/20 text-white'}`}
-                        title={isRecording ? 'Stop Recording' : 'Start Recording'}
-                    >
-                        {isRecording ? <Square className="w-6 h-6 fill-white" /> : <Circle className="w-6 h-6" />}
-                    </button>
-
-                    <button
-                        onClick={() => setShowInviteModal(true)}
-                        className="p-4 rounded-full bg-white/10 hover:bg-white/20 text-white transition-all"
-                        title="Invite"
-                    >
-                        <Share2 className="w-6 h-6" />
-                    </button>
-
-                    <button
-                        onClick={endCall}
-                        className="px-8 py-4 rounded-full bg-red-600 hover:bg-red-700 text-white transition-all"
-                        title="End Call"
-                    >
-                        <PhoneOff className="w-6 h-6" />
-                    </button>
-                </div>
-            </main>
+                            {/* Input — hidden on Poll tab */}
+                            {chatTab !== 'poll' && <div className="p-3 border-t border-white/10">
+                                <form onSubmit={(e) => { e.preventDefault(); sendRoomChatMessage(); }} className="flex gap-2">
+                                    <input type="text" value={roomChatInput} onChange={e => setRoomChatInput(e.target.value)}
+                                        placeholder={chatTab === 'group' ? 'Message everyone…' : 'Private message…'}
+                                        className="flex-1 bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-purple-500 transition-colors" />
+                                    <button type="submit" disabled={!roomChatInput.trim()}
+                                        className="p-2 bg-purple-600 text-white rounded-xl hover:bg-purple-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
+                                        <Send className="w-4 h-4" />
+                                    </button>
+                                </form>
+                                <p className="text-xs text-gray-700 mt-2 text-center">Chats are saved to History when the call ends</p>
+                            </div>}
+                        </motion.aside>
+                    )}
+                </AnimatePresence>
+            </div>
 
             {/* Invite Modal */}
             <AnimatePresence>
                 {showInviteModal && (
                     <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-                        <motion.div
-                            initial={{ opacity: 0, scale: 0.95 }}
-                            animate={{ opacity: 1, scale: 1 }}
-                            exit={{ opacity: 0, scale: 0.95 }}
-                            className="bg-[#111] w-full max-w-md rounded-3xl border border-white/10 p-6"
-                        >
-                            <h2 className="text-xl font-bold mb-4">Invite to Meeting</h2>
-                            <p className="text-gray-400 text-sm mb-6">Share this link or room code to invite others.</p>
-
+                        <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }}
+                            className="bg-[#111] w-full max-w-md rounded-3xl border border-white/10 p-6">
+                            <h2 className="text-xl font-bold mb-2">Invite to Meeting</h2>
+                            <p className="text-gray-400 text-sm mb-6">Share the room code or link. The call connects automatically once they join.</p>
                             <div className="space-y-4">
                                 <div>
                                     <label className="block text-sm text-gray-400 mb-2">Room Code</label>
-                                    <div className="bg-black/50 border border-white/10 rounded-xl px-4 py-3 font-mono text-xl tracking-widest text-center">
-                                        {roomId}
-                                    </div>
+                                    <div className="bg-black/50 border border-white/10 rounded-xl px-4 py-3 font-mono text-xl tracking-widest text-center">{roomId}</div>
                                 </div>
-
                                 <div>
                                     <label className="block text-sm text-gray-400 mb-2">Invite Link</label>
                                     <div className="flex gap-2">
-                                        <input
-                                            type="text"
-                                            readOnly
+                                        <input type="text" readOnly
                                             value={`${typeof window !== 'undefined' ? window.location.origin : ''}/zoom/${roomId}`}
-                                            className="flex-1 bg-black/50 border border-white/10 rounded-xl px-4 py-3 text-sm text-gray-300"
-                                        />
-                                        <button
-                                            onClick={copyInviteLink}
-                                            className={`px-4 py-3 rounded-xl transition-all flex items-center gap-2 ${linkCopied ? 'bg-green-600 text-white' : 'bg-white/10 hover:bg-white/20 text-white'}`}
-                                        >
+                                            className="flex-1 bg-black/50 border border-white/10 rounded-xl px-4 py-3 text-sm text-gray-300" />
+                                        <button onClick={copyInviteLink}
+                                            className={`px-4 py-3 rounded-xl transition-all flex items-center gap-2 ${linkCopied ? 'bg-green-600' : 'bg-white/10 hover:bg-white/20'}`}>
                                             {linkCopied ? <Check className="w-5 h-5" /> : <Copy className="w-5 h-5" />}
                                         </button>
                                     </div>
                                 </div>
                             </div>
-
-                            <button
-                                onClick={() => setShowInviteModal(false)}
-                                className="w-full mt-6 py-3 bg-white/10 hover:bg-white/20 rounded-xl transition-all"
-                            >
-                                Close
-                            </button>
+                            <button onClick={() => setShowInviteModal(false)}
+                                className="w-full mt-6 py-3 bg-white/10 hover:bg-white/20 rounded-xl transition-all">Close</button>
                         </motion.div>
                     </div>
                 )}
             </AnimatePresence>
 
-            {/* Netflix-style DRM CSS Protection */}
+            {/* Netflix-style DRM CSS */}
             <style jsx global>{`
-                /* Prevent video capture via CSS */
-                .drm-video-protected {
-                    -webkit-user-select: none;
-                    user-select: none;
-                }
-                
-                .drm-video-protected video {
-                    -webkit-touch-callout: none;
-                    -webkit-user-select: none;
-                    user-select: none;
-                }
-                
-                /* Hide content when printing (screenshot via print) */
-                @media print {
-                    .drm-video-protected,
-                    .drm-video-protected video {
-                        visibility: hidden !important;
-                        display: none !important;
-                    }
-                }
-                
-                /* Experimental: Make video harder to screen record */
-                .drm-video-protected video {
-                    -webkit-transform: translateZ(0);
-                    transform: translateZ(0);
-                    backface-visibility: hidden;
-                    -webkit-backface-visibility: hidden;
-                }
-                
-                /* Netflix-Style Screen Recording Block */
-                /* This uses hardware acceleration and display list isolation */
-                .screen-recording-blocked {
-                    /* Force GPU compositing which some screen recorders can't capture */
-                    transform: translate3d(0, 0, 0);
-                    -webkit-transform: translate3d(0, 0, 0);
-                    
-                    /* Isolate from parent composition */
-                    isolation: isolate;
-                    contain: strict;
-                    
-                    /* Force hardware acceleration on video */
-                    will-change: transform;
-                }
-                
-                .screen-recording-blocked video {
-                    /* Force hardware decoding path */
-                    transform: translateZ(0) scale(1.0001);
-                    -webkit-transform: translateZ(0) scale(1.0001);
-                    
-                    /* Attempt to use protected media path */
-                    -webkit-video-playable-inline: true;
-                    
-                    /* Force GPU layer */
-                    will-change: transform, opacity;
-                    
-                    /* Block extraction */
-                    object-fit: cover;
-                    image-rendering: optimizeQuality;
-                }
-                
-                /* Additional protection: overlay that appears on capture attempt */
-                .screen-recording-blocked::after {
-                    content: '';
-                    position: absolute;
-                    top: 0;
-                    left: 0;
-                    right: 0;
-                    bottom: 0;
-                    pointer-events: none;
-                    background: transparent;
-                    /* This becomes visible in some screen capture scenarios */
-                    mix-blend-mode: difference;
-                    z-index: 1;
-                }
-                
-                /* Webkit hardware pipeline hint */
-                @supports (-webkit-overflow-scrolling: touch) {
-                    .screen-recording-blocked video {
-                        -webkit-overflow-scrolling: touch;
-                        -webkit-mask-image: -webkit-linear-gradient(white, white);
-                    }
-                }
-                
-                /* Flash animation for screenshot blocked overlay */
-                @keyframes flash {
-                    0%, 100% { opacity: 1; }
-                    50% { opacity: 0.7; }
-                }
-                
-                @keyframes pulse-border {
-                    0%, 100% { border-color: #dc2626; }
-                    50% { border-color: #fbbf24; }
-                }
+                .drm-video-protected { -webkit-user-select: none; user-select: none; }
+                .drm-video-protected video { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; -webkit-transform: translateZ(0); transform: translateZ(0); backface-visibility: hidden; -webkit-backface-visibility: hidden; }
+                @media print { .drm-video-protected, .drm-video-protected video { visibility: hidden !important; display: none !important; } }
+                .screen-recording-blocked { transform: translate3d(0,0,0); -webkit-transform: translate3d(0,0,0); isolation: isolate; contain: strict; will-change: transform; }
+                .screen-recording-blocked video { transform: translateZ(0) scale(1.0001); -webkit-transform: translateZ(0) scale(1.0001); will-change: transform, opacity; object-fit: cover; }
+                .screen-recording-blocked::after { content: ''; position: absolute; top:0; left:0; right:0; bottom:0; pointer-events: none; background: transparent; mix-blend-mode: difference; z-index: 1; }
+                @keyframes flash { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
             `}</style>
         </div>
     );

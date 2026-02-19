@@ -65,6 +65,7 @@ export default function SearchPage() {
 
     const [playingVideo, setPlayingVideo] = useState<string | null>(null);
     const [historyView, setHistoryView] = useState<'recordings' | 'chats' | 'trash'>('recordings');
+    const [historyToast, setHistoryToast] = useState<{ type: 'success' | 'error'; msg: string } | null>(null);
 
     // Mock Profiles Data
     const MOCK_PROFILES: Profile[] = [
@@ -253,6 +254,11 @@ export default function SearchPage() {
 
     const searchParams = useSearchParams();
 
+    const showToast = (type: 'success' | 'error', msg: string) => {
+        setHistoryToast({ type, msg });
+        setTimeout(() => setHistoryToast(null), 5000);
+    };
+
     // Fetch Zoom recordings, trash, and chat history from IndexedDB
     const fetchData = async () => {
         try {
@@ -295,11 +301,13 @@ export default function SearchPage() {
         try {
             await deleteRecording(id);
             setZoomRecordings(prev => prev.filter(r => r.id !== id));
-            // Refresh trash list
             const trash = await getTrashRecordings();
             setTrashRecordings(trash);
+            showToast('success', 'Recording moved to Recycle Bin.');
         } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
             console.error('Failed to delete recording:', err);
+            showToast('error', `Delete failed: ${msg}`);
         }
     };
 
@@ -308,11 +316,13 @@ export default function SearchPage() {
         try {
             await restoreFromTrash(id);
             setTrashRecordings(prev => prev.filter(r => r.id !== id));
-            // Refresh main list
             const recordings = await getAllRecordings();
             setZoomRecordings(recordings);
+            showToast('success', 'Recording restored!');
         } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
             console.error('Failed to restore recording:', err);
+            showToast('error', `Restore failed: ${msg}`);
         }
     };
 
@@ -322,8 +332,11 @@ export default function SearchPage() {
             try {
                 await permanentlyDelete(id);
                 setTrashRecordings(prev => prev.filter(r => r.id !== id));
+                showToast('success', 'Recording permanently deleted.');
             } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
                 console.error('Failed to permanently delete recording:', err);
+                showToast('error', `Permanent delete failed: ${msg}`);
             }
         }
     };
@@ -334,8 +347,11 @@ export default function SearchPage() {
             try {
                 await emptyTrash();
                 setTrashRecordings([]);
+                showToast('success', 'Recycle Bin emptied.');
             } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
                 console.error('Failed to empty trash:', err);
+                showToast('error', `Empty trash failed: ${msg}`);
             }
         }
     };
@@ -642,20 +658,26 @@ export default function SearchPage() {
 
     const handleChatClose = async () => {
         if (activeChatMessages.length > 0 && selectedProfile) {
-            // Save session before closing
-            const session: ChatSession = {
+            const chatSession: ChatSession = {
                 id: Date.now().toString(),
                 partnerId: selectedProfile.id,
                 partnerName: selectedProfile.name,
                 date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
                 timestamp: Date.now(),
                 messages: activeChatMessages,
-                size: calculateChatSize(activeChatMessages) // now imported
+                size: calculateChatSize(activeChatMessages)
             };
-            await saveChatSession(session);
-            // Refresh history
-            const chats = await getAllChatSessions();
-            setChatHistory(chats);
+            try {
+                await saveChatSession(chatSession);
+                // Refresh history so it shows immediately when user switches to History tab
+                const chats = await getAllChatSessions();
+                setChatHistory(chats);
+                showToast('success', 'Chat saved to History!');
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                console.error('Failed to save chat session:', err);
+                showToast('error', `Chat save failed: ${msg}`);
+            }
         }
         setIsChatOpen(false);
         setActiveChatMessages([]);
@@ -665,11 +687,15 @@ export default function SearchPage() {
         // If exporting currently open chat
         let messages = activeChatMessages;
         let partnerName = selectedProfile?.name || 'User';
+        let senderLabel = partnerName; // label shown in transcript for 'partner' messages
 
         // If exporting from history (sessionToExport provided)
         if (sessionToExport) {
             messages = sessionToExport.messages;
             partnerName = sessionToExport.partnerName;
+            // Zoom chat sessions use "Participant" so the transcript isn't labelled
+            // with the long session name ("Group Chat Discussion — Room XYZ")
+            senderLabel = sessionToExport.id.startsWith('zoom-') ? 'Participant' : sessionToExport.partnerName;
         }
 
         if (messages.length === 0) {
@@ -678,7 +704,7 @@ export default function SearchPage() {
         }
 
         const transcript = messages.map(m =>
-            `[${new Date(m.timestamp).toLocaleTimeString()}] ${m.sender === 'user' ? 'You' : partnerName}: ${m.text}`
+            `[${new Date(m.timestamp).toLocaleTimeString()}] ${m.sender === 'user' ? 'You' : senderLabel}: ${m.text}`
         ).join('\n\n');
 
         const blob = new Blob([transcript], { type: 'text/plain' });
@@ -830,11 +856,18 @@ export default function SearchPage() {
                                         >
                                             <div className="flex items-center justify-between">
                                                 <div className="flex items-center gap-4">
-                                                    <div className="p-3 rounded-lg bg-blue-500/10 text-blue-400">
-                                                        <MessageSquare className="w-6 h-6" />
+                                                    <div className={`p-3 rounded-lg ${chat.id.startsWith('zoom-') ? 'bg-purple-500/10 text-purple-400' : 'bg-blue-500/10 text-blue-400'}`}>
+                                                        {chat.id.startsWith('zoom-') ? <Video className="w-6 h-6" /> : <MessageSquare className="w-6 h-6" />}
                                                     </div>
                                                     <div>
-                                                        <h3 className="font-bold text-white">Chat with {chat.partnerName}</h3>
+                                                        <div className="flex items-center gap-2 flex-wrap">
+                                                            <h3 className="font-bold text-white">
+                                                                {chat.id.startsWith('zoom-') ? chat.partnerName : `Chat with ${chat.partnerName}`}
+                                                            </h3>
+                                                            {chat.id.startsWith('zoom-') && (
+                                                                <span className="text-xs px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30">ZoomChat</span>
+                                                            )}
+                                                        </div>
                                                         <p className="text-sm text-gray-500">{chat.date} • {chat.messages.length} messages • {chat.size}</p>
                                                     </div>
                                                 </div>
@@ -849,8 +882,14 @@ export default function SearchPage() {
                                                     <button
                                                         onClick={async () => {
                                                             if (confirm('Delete this chat history?')) {
-                                                                await deleteChatSession(chat.id);
-                                                                setChatHistory(prev => prev.filter(c => c.id !== chat.id));
+                                                                try {
+                                                                    await deleteChatSession(chat.id);
+                                                                    setChatHistory(prev => prev.filter(c => c.id !== chat.id));
+                                                                    showToast('success', 'Chat deleted.');
+                                                                } catch (err) {
+                                                                    const msg = err instanceof Error ? err.message : String(err);
+                                                                    showToast('error', `Delete failed: ${msg}`);
+                                                                }
                                                             }
                                                         }}
                                                         className="p-2 bg-red-600/10 text-red-400 rounded-lg hover:bg-red-600/20 border border-red-500/20 transition-colors"
@@ -867,7 +906,7 @@ export default function SearchPage() {
                                 <div className="text-center py-12 bg-[#111] rounded-2xl border border-white/5">
                                     <MessageSquare className="w-16 h-16 mx-auto mb-4 text-gray-600" />
                                     <h3 className="text-xl font-bold text-gray-400 mb-2">No Chats Yet</h3>
-                                    <p className="text-gray-500">Start a chat with a profile to save conversations here.</p>
+                                    <p className="text-gray-500">Start a chat with a profile or end a Zoom call to save conversations here.</p>
                                 </div>
                             )}
                         </div>
@@ -1102,6 +1141,21 @@ export default function SearchPage() {
     return (
         <div className={`min-h-screen font-sans selection:bg-cyan-500/30 transition-colors duration-300 ${isDayMode ? 'bg-[#f0f2f5] text-gray-900' : 'bg-[#0a0a0f] text-white'}`}>
             <GlobalNavbar />
+
+            {/* History Toast Notifications */}
+            <AnimatePresence>
+                {historyToast && (
+                    <motion.div
+                        key={historyToast.msg}
+                        initial={{ opacity: 0, y: -50 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -50 }}
+                        className={`fixed top-20 left-1/2 -translate-x-1/2 z-[200] backdrop-blur-sm px-6 py-3 rounded-xl flex items-center gap-3 shadow-lg max-w-lg text-center text-white ${historyToast.type === 'success' ? 'bg-green-600/90' : 'bg-red-600/90'}`}
+                    >
+                        <span className="font-medium text-sm">{historyToast.msg}</span>
+                    </motion.div>
+                )}
+            </AnimatePresence>
 
             <main className="max-w-7xl mx-auto px-6 py-8 flex flex-col lg:flex-row gap-8">
                 {/* Sidebar Navigation */}

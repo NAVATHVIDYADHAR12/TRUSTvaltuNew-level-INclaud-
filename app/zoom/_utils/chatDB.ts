@@ -1,8 +1,10 @@
+// IndexedDB helper for Chat History.
+// Uses a DEDICATED database ('TVaultChats') so it never conflicts
+// with other stores that may be at different versions or in bad states.
 
-// IndexedDB helper for Chat History
-const DB_NAME = 'CreatorSecureDB'; // Same DB as recordings to share versioning
-const CHAT_STORE_NAME = 'chatHistory';
-const DB_VERSION = 3; // Bump version for chat store
+const DB_NAME = 'TVaultChats';
+const DB_VERSION = 1;
+const STORE = 'chatSessions';
 
 export interface ChatMessage {
     sender: 'user' | 'partner';
@@ -14,82 +16,64 @@ export interface ChatSession {
     id: string;
     partnerId: string;
     partnerName: string;
-    date: string; // Formatted date string
-    timestamp: number; // Raw timestamp for sorting
+    date: string;
+    timestamp: number;
     messages: ChatMessage[];
-    size: string; // Estimated size
+    size: string;
 }
 
-const openDB = (): Promise<IDBDatabase> => {
-    return new Promise((resolve, reject) => {
-        const request = indexedDB.open(DB_NAME, DB_VERSION);
-
-        request.onerror = () => reject(request.error);
-        request.onsuccess = () => resolve(request.result);
-
-        request.onupgradeneeded = (event) => {
-            const db = (event.target as IDBOpenDBRequest).result;
-
-            // Ensure previous stores exist (from recordingsDB)
-            if (!db.objectStoreNames.contains('zoomRecordings')) {
-                db.createObjectStore('zoomRecordings', { keyPath: 'id' });
-            }
-            if (!db.objectStoreNames.contains('recycleBin')) {
-                db.createObjectStore('recycleBin', { keyPath: 'id' });
-            }
-
-            // Create Chat History Store
-            if (!db.objectStoreNames.contains(CHAT_STORE_NAME)) {
-                db.createObjectStore(CHAT_STORE_NAME, { keyPath: 'id' });
+// ── DB open ────────────────────────────────────────────────────────────────────
+const openDB = (): Promise<IDBDatabase> =>
+    new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, DB_VERSION);
+        req.onerror = () => reject(req.error ?? new Error('IDB open failed'));
+        req.onsuccess = () => resolve(req.result);
+        req.onupgradeneeded = (e) => {
+            const db = (e.target as IDBOpenDBRequest).result;
+            if (!db.objectStoreNames.contains(STORE)) {
+                db.createObjectStore(STORE, { keyPath: 'id' });
             }
         };
     });
-};
 
+// ── Save chat session ──────────────────────────────────────────────────────────
 export const saveChatSession = async (session: ChatSession): Promise<void> => {
     const db = await openDB();
     return new Promise((resolve, reject) => {
-        const transaction = db.transaction(CHAT_STORE_NAME, 'readwrite');
-        const store = transaction.objectStore(CHAT_STORE_NAME);
-        const request = store.put(session);
-
-        request.onsuccess = () => resolve();
-        request.onerror = () => reject(request.error);
+        let tx: IDBTransaction;
+        try {
+            tx = db.transaction(STORE, 'readwrite');
+            tx.objectStore(STORE).put(session);
+        } catch (e) { reject(e); return; }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error ?? new Error('Chat save failed'));
     });
 };
 
+// ── Get all chat sessions ──────────────────────────────────────────────────────
 export const getAllChatSessions = async (): Promise<ChatSession[]> => {
     const db = await openDB();
     return new Promise((resolve, reject) => {
-        const transaction = db.transaction(CHAT_STORE_NAME, 'readonly');
-        const store = transaction.objectStore(CHAT_STORE_NAME);
-        const request = store.getAll();
-
-        request.onsuccess = () => {
-            // Sort by timestamp descending (newest first)
-            const sessions = request.result.sort((a, b) => b.timestamp - a.timestamp);
-            resolve(sessions);
-        };
-        request.onerror = () => reject(request.error);
+        const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll();
+        req.onsuccess = () =>
+            resolve((req.result ?? []).sort((a, b) => b.timestamp - a.timestamp));
+        req.onerror = () => reject(req.error);
     });
 };
 
+// ── Delete chat session ────────────────────────────────────────────────────────
 export const deleteChatSession = async (id: string): Promise<void> => {
     const db = await openDB();
     return new Promise((resolve, reject) => {
-        const transaction = db.transaction(CHAT_STORE_NAME, 'readwrite');
-        const store = transaction.objectStore(CHAT_STORE_NAME);
-        const request = store.delete(id);
-
-        request.onsuccess = () => resolve();
-        request.onerror = () => reject(request.error);
+        const req = db.transaction(STORE, 'readwrite').objectStore(STORE).delete(id);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
     });
 };
 
-// Calculate size string from messages (e.g., "1.2 KB")
+// ── Utility ────────────────────────────────────────────────────────────────────
 export const calculateChatSize = (messages: ChatMessage[]): string => {
-    const jsonString = JSON.stringify(messages);
-    const bytes = new TextEncoder().encode(jsonString).length;
+    const bytes = new TextEncoder().encode(JSON.stringify(messages)).length;
     if (bytes < 1024) return `${bytes} B`;
     return `${(bytes / 1024).toFixed(1)} KB`;
 };
