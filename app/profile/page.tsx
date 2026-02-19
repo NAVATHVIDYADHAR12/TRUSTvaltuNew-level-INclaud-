@@ -1,6 +1,6 @@
 "use client";
 
-import { useSession, signOut } from "../../lib/mock-auth";
+import { useSession, signOut, generateProfileId } from "../../lib/mock-auth";
 import { useRouter } from "next/navigation";
 import { useEffect, useState, useRef } from "react";
 import {
@@ -168,10 +168,25 @@ export default function Profile() {
             // Try to load from localStorage first (preserves existing data)
             let storedData = loadFromLocalStorage();
 
+            // If stored data has a stale/demo ID (not TVX format), regenerate it from session email.
+            // This fixes the "demo-user-1" problem: localStorage had old data from before
+            // generateProfileId was introduced, so we must upgrade it.
+            if (storedData) {
+                const tvxPattern = /^TVX-[A-Z0-9]{1,5}-[A-F0-9]{6}$/i;
+                if (!tvxPattern.test(storedData._id)) {
+                    const userEmail = (session?.user?.email || storedData.email || 'demo@example.com');
+                    const freshId = generateProfileId(userEmail);
+                    storedData = { ...storedData, _id: freshId, email: userEmail };
+                    // Persist the upgraded ID immediately
+                    localStorage.setItem('creatorSecureProfile', JSON.stringify(storedData));
+                }
+            }
+
             // If no stored data, create initial mock data
             if (!storedData) {
+                const userEmail = session.user.email || 'demo@example.com';
                 storedData = {
-                    _id: session.user.id || 'demo-user-1',
+                    _id: generateProfileId(userEmail),
                     name: session.user.name || 'Demo User',
                     email: session.user.email || 'demo@example.com',
                     profilePic: session.user.image || session.user.profilePic || 'https://ui-avatars.com/api/?name=Demo+User&background=random',
@@ -674,11 +689,21 @@ export default function Profile() {
                                 </button>
                             </div>
 
-                            {/* ID Box */}
-                            <div className="flex items-center justify-center md:justify-start gap-3 bg-black/40 w-fit mx-auto md:mx-0 px-4 py-2 rounded-lg border border-white/5 group cursor-pointer" onClick={copyToClipboard}>
-                                <div className="text-xs text-gray-500 uppercase font-bold tracking-wider">Unique ID</div>
-                                <code className="font-mono text-neon-cyan">{userData._id}</code>
-                                {copied ? <Check size={14} className="text-green-500" /> : <Copy size={14} className="text-gray-600 group-hover:text-white" />}
+                            {/* Profile ID Box — used for meeting join verification */}
+                            <div
+                                className="flex items-center gap-3 bg-gradient-to-r from-neon-blue/10 to-purple-600/10 border border-neon-blue/30 rounded-xl px-4 py-3 cursor-pointer group w-fit mx-auto md:mx-0 hover:border-neon-blue/60 transition-all"
+                                onClick={copyToClipboard}
+                                title="Click to copy your Platform Profile ID"
+                            >
+                                <Shield size={16} className="text-neon-blue shrink-0" />
+                                <div>
+                                    <div className="text-[10px] text-gray-500 uppercase font-bold tracking-widest mb-0.5">Platform Profile ID · Used for Secure Meetings</div>
+                                    <code className="font-mono text-neon-cyan font-bold tracking-wide">{userData._id}</code>
+                                </div>
+                                {copied
+                                    ? <Check size={14} className="text-green-400 shrink-0" />
+                                    : <Copy size={14} className="text-gray-600 group-hover:text-neon-blue shrink-0 transition-colors" />
+                                }
                             </div>
 
                             {/* Stats (REAL) */}

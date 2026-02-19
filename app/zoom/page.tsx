@@ -51,6 +51,8 @@ export default function ZoomLobbyPage() {
 
     const handleCreateRoom = () => {
         const newRoomId = generateRoomId();
+        // Mark this browser as the host for this room
+        localStorage.setItem(`zoom_host_${newRoomId}`, 'true');
         router.push(`/zoom/${newRoomId}`);
     };
 

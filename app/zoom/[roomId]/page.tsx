@@ -6,8 +6,9 @@ import GlobalNavbar from '../../_components/GlobalNavbar';
 import {
     Mic, MicOff, Camera, CameraOff, PhoneOff, Copy, Users, Shield, Circle, Square,
     Share2, Check, AlertTriangle, Loader2, Monitor, MonitorOff, MessageSquare,
-    Heart, X, Send, BarChart2, ChevronDown
+    Heart, X, Send, BarChart2, ChevronDown, UserCheck, UserX, Bookmark, BookmarkX
 } from 'lucide-react';
+import { generateProfileId } from '../../../lib/mock-auth';
 import { motion, AnimatePresence } from 'framer-motion';
 import { saveRecording, ZoomRecording } from '../_utils/recordingsDB';
 import { saveChatSession, calculateChatSize, ChatMessage } from '../_utils/chatDB';
@@ -29,6 +30,18 @@ interface InRoomMsg {
     text: string;
     sender: 'me' | 'remote';
     timestamp: number;
+}
+
+// ── Participant type ──────────────────────────────────────────────────────────
+interface Participant {
+    id: string;         // unique join id
+    name: string;
+    email: string;
+    profileId: string;  // TVX-XXX-XXXXXX
+    joinedAt: number;
+    isHost: boolean;
+    screenShareAllowed: boolean;
+    isPinned: boolean;
 }
 
 // ── Recording watermark config (mirrors GlobalNavbar export) ─────────────────
@@ -190,6 +203,19 @@ export default function MeetingRoomPage() {
     const [floatingReactions, setFloatingReactions] = useState<{ id: number; emoji: string; x: number }[]>([]);
     const [showReactionPoll, setShowReactionPoll] = useState(false);
 
+    // ── Participant / join-verification state ─────────────────────────────────
+    const [isHost, setIsHost] = useState(false);
+    const [participants, setParticipants] = useState<Participant[]>([]);
+    const [showParticipantsPanel, setShowParticipantsPanel] = useState(false);
+    const [pinnedParticipantId, setPinnedParticipantId] = useState<string | null>(null);
+    // Join-verification modal (shown for non-host visitors)
+    const [showJoinModal, setShowJoinModal] = useState(false);
+    const [joinName, setJoinName] = useState('');
+    const [joinEmail, setJoinEmail] = useState('');
+    const [joinProfileId, setJoinProfileId] = useState('');
+    const [joinError, setJoinError] = useState('');
+    const [joinLoading, setJoinLoading] = useState(false);
+
     const { drmEnabled, drmSettings } = useDRMProtection();
 
     // ── Load recording watermark config from localStorage + listen for updates ─
@@ -218,6 +244,105 @@ export default function MeetingRoomPage() {
         const label = `🔒 ${sessionFingerprint || roomId} • ROOM-${roomId} • PROTECTED`;
         wmControlRef.current?.(drmSettings.watermarkOverlay, label, recWmConfig);
     }, [drmSettings.watermarkOverlay, recWmConfig, sessionFingerprint, roomId]);
+
+    // ── Effect: Detect host vs guest & init participant list ──────────────────
+    useEffect(() => {
+        if (!roomId) return;
+        const hostFlag = localStorage.getItem(`zoom_host_${roomId}`);
+        const isHostUser = hostFlag === 'true';
+        setIsHost(isHostUser);
+
+        // Load stored participants for this room
+        const storedKey = `zoom_participants_${roomId}`;
+        const stored: Participant[] = (() => {
+            try { return JSON.parse(localStorage.getItem(storedKey) || '[]'); }
+            catch (_) { return []; }
+        })();
+
+        if (isHostUser) {
+            // Auto-add host if not already present
+            const session = (() => {
+                try { return JSON.parse(localStorage.getItem('tvx_session') || 'null'); } catch (_) { return null; }
+            })();
+            const hostEmail = session?.email || 'host@trustvaultx.com';
+            const hostName = session?.name || 'Host';
+            const hostProfileId = session?.profileId || generateProfileId(hostEmail);
+            const alreadyAdded = stored.some(p => p.isHost);
+            const finalList = alreadyAdded ? stored : [
+                {
+                    id: `host-${Date.now()}`,
+                    name: hostName,
+                    email: hostEmail,
+                    profileId: hostProfileId,
+                    joinedAt: Date.now(),
+                    isHost: true,
+                    screenShareAllowed: true,
+                    isPinned: false,
+                },
+                ...stored.filter(p => !p.isHost),
+            ];
+            setParticipants(finalList);
+            localStorage.setItem(storedKey, JSON.stringify(finalList));
+        } else {
+            // Guest — show join modal, load existing participants
+            setParticipants(stored);
+            setShowJoinModal(true);
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [roomId]);
+
+    // Persist participants on change
+    useEffect(() => {
+        if (!roomId || participants.length === 0) return;
+        localStorage.setItem(`zoom_participants_${roomId}`, JSON.stringify(participants));
+    }, [participants, roomId]);
+
+    // ── Participant management ─────────────────────────────────────────────────
+    const handleJoinVerification = () => {
+        setJoinError('');
+        if (!joinName.trim()) { setJoinError('Please enter your full name.'); return; }
+        const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRx.test(joinEmail.trim())) { setJoinError('Please enter a valid email address.'); return; }
+        const idRx = /^TVX-[A-Z0-9]{1,4}-[A-F0-9]{6}$/i;
+        if (!idRx.test(joinProfileId.trim())) {
+            setJoinError('Invalid Profile ID. Format: TVX-XXX-XXXXXX (copy from your Profile page).');
+            return;
+        }
+        setJoinLoading(true);
+        setTimeout(() => {
+            const newParticipant: Participant = {
+                id: `guest-${Date.now()}`,
+                name: joinName.trim(),
+                email: joinEmail.trim(),
+                profileId: joinProfileId.trim().toUpperCase(),
+                joinedAt: Date.now(),
+                isHost: false,
+                screenShareAllowed: false,
+                isPinned: false,
+            };
+            setParticipants(prev => [...prev, newParticipant]);
+            setShowJoinModal(false);
+            setJoinLoading(false);
+        }, 800);
+    };
+
+    const toggleScreenShare = (participantId: string) => {
+        setParticipants(prev => prev.map(p =>
+            p.id === participantId ? { ...p, screenShareAllowed: !p.screenShareAllowed } : p
+        ));
+    };
+
+    const pinParticipant = (participantId: string) => {
+        setPinnedParticipantId(prev => prev === participantId ? null : participantId);
+        setParticipants(prev => prev.map(p => ({
+            ...p,
+            isPinned: p.id === participantId ? !p.isPinned : false,
+        })));
+    };
+
+    const removeParticipant = (participantId: string) => {
+        setParticipants(prev => prev.filter(p => p.id !== participantId));
+    };
 
     // ── Floating reaction animation ───────────────────────────────────────────
     const addFloatingReaction = useCallback((emoji: string) => {
@@ -1054,7 +1179,7 @@ export default function MeetingRoomPage() {
         }
     };
 
-    const participantCount = connectionState === 'connected' ? 2 : 1;
+    const participantCount = Math.max(participants.length, connectionState === 'connected' ? 2 : 1);
     const activeMessages = chatTab === 'group' ? groupMessages : chatTab === 'private' ? privateMessages : [];
 
     // ── Render ─────────────────────────────────────────────────────────────────
@@ -1155,10 +1280,14 @@ export default function MeetingRoomPage() {
                                 <span className="text-sm text-gray-400">Room:</span>
                                 <span className="font-mono font-bold tracking-widest">{roomId}</span>
                             </div>
-                            <div className="flex items-center gap-2 text-sm text-gray-400">
+                            <button
+                                onClick={() => setShowParticipantsPanel(p => !p)}
+                                className={`flex items-center gap-2 text-sm px-3 py-1.5 rounded-lg border transition-all ${showParticipantsPanel ? 'bg-purple-600/20 border-purple-500/40 text-purple-300' : 'text-gray-400 border-white/10 hover:bg-white/5'}`}
+                            >
                                 <Users className="w-4 h-4" />
                                 {participantCount} participant{participantCount > 1 ? 's' : ''}
-                            </div>
+                                <ChevronDown className={`w-3 h-3 transition-transform ${showParticipantsPanel ? 'rotate-180' : ''}`} />
+                            </button>
                         </div>
                         <div className="flex items-center gap-2">
                             {isRecording && (
@@ -1192,6 +1321,87 @@ export default function MeetingRoomPage() {
                             )}
                         </div>
                     </div>
+
+                    {/* Participants Panel */}
+                    <AnimatePresence>
+                        {showParticipantsPanel && (
+                            <motion.div
+                                initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }}
+                                className="mb-4 overflow-hidden bg-[#111] rounded-2xl border border-white/10 shadow-2xl"
+                            >
+                                <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between">
+                                    <span className="text-sm font-bold flex items-center gap-2">
+                                        <Users className="w-4 h-4 text-purple-400" /> Participants ({participants.length})
+                                    </span>
+                                    {isHost && (
+                                        <span className="text-xs text-gray-500">As host you can grant/revoke screen share access</span>
+                                    )}
+                                </div>
+                                <div className="divide-y divide-white/5 max-h-52 overflow-y-auto">
+                                    {participants.length === 0 ? (
+                                        <div className="px-4 py-6 text-center text-gray-600 text-sm">No verified participants yet.</div>
+                                    ) : participants.map(p => (
+                                        <div key={p.id} className={`flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition-colors group ${p.isPinned ? 'bg-purple-600/10 border-l-2 border-purple-500' : ''}`}>
+                                            {/* Avatar */}
+                                            <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold border shrink-0 ${p.isHost ? 'bg-purple-600/30 border-purple-500/40 text-purple-300' : 'bg-blue-600/20 border-blue-500/30 text-blue-300'}`}>
+                                                {p.name.charAt(0).toUpperCase()}
+                                            </div>
+                                            {/* Info */}
+                                            <div className="flex-1 min-w-0">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-sm font-medium text-white truncate">{p.name}</span>
+                                                    {p.isHost && <span className="text-[10px] px-1.5 py-0.5 bg-purple-600/20 text-purple-400 border border-purple-500/30 rounded font-bold">HOST</span>}
+                                                    {p.isPinned && <span className="text-[10px] text-purple-400">📌</span>}
+                                                </div>
+                                                <div className="flex items-center gap-2 mt-0.5">
+                                                    <code className="text-[10px] text-neon-cyan font-mono">{p.profileId}</code>
+                                                    <span className="text-[10px] text-gray-600 truncate">{p.email}</span>
+                                                </div>
+                                            </div>
+                                            {/* Actions (host only for non-host participants) */}
+                                            <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                                                {/* Pin/Unpin — show their video in remote slot */}
+                                                {!p.isHost && (
+                                                    <button
+                                                        onClick={() => pinParticipant(p.id)}
+                                                        title={p.isPinned ? 'Unpin from view' : 'Pin to remote view'}
+                                                        className={`p-1.5 rounded-lg transition-colors ${p.isPinned ? 'bg-purple-600/30 text-purple-300' : 'bg-white/5 text-gray-400 hover:text-white'}`}
+                                                    >
+                                                        {p.isPinned ? <BookmarkX className="w-3.5 h-3.5" /> : <Bookmark className="w-3.5 h-3.5" />}
+                                                    </button>
+                                                )}
+                                                {/* Screen share toggle (host only, for guests) */}
+                                                {isHost && !p.isHost && (
+                                                    <button
+                                                        onClick={() => toggleScreenShare(p.id)}
+                                                        title={p.screenShareAllowed ? 'Revoke screen share access' : 'Grant screen share access'}
+                                                        className={`p-1.5 rounded-lg transition-colors flex items-center gap-1 text-xs font-medium ${p.screenShareAllowed ? 'bg-green-600/20 text-green-400 border border-green-500/30' : 'bg-white/5 text-gray-400 hover:text-white border border-white/10'}`}
+                                                    >
+                                                        <Monitor className="w-3.5 h-3.5" />
+                                                        {p.screenShareAllowed ? 'Revoke' : 'Allow'}
+                                                    </button>
+                                                )}
+                                                {/* Remove (host only) */}
+                                                {isHost && !p.isHost && (
+                                                    <button
+                                                        onClick={() => removeParticipant(p.id)}
+                                                        title="Remove from meeting"
+                                                        className="p-1.5 rounded-lg bg-red-600/10 text-red-400 hover:bg-red-600/20 transition-colors"
+                                                    >
+                                                        <UserX className="w-3.5 h-3.5" />
+                                                    </button>
+                                                )}
+                                                {/* Screen share badge for allowed participants */}
+                                                {!isHost && p.screenShareAllowed && !p.isHost && (
+                                                    <span className="text-[10px] px-1.5 py-0.5 bg-green-600/20 text-green-400 border border-green-500/30 rounded">Screen ✓</span>
+                                                )}
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </motion.div>
+                        )}
+                    </AnimatePresence>
 
                     {/* Video Grid */}
                     <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
@@ -1285,10 +1495,15 @@ export default function MeetingRoomPage() {
                             )}
                             <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-sm px-3 py-1 rounded-lg text-sm">
                                 {connectionState === 'connected'
-                                    ? remoteScreenSharing ? '🖥️ Remote (Screen Share)' : 'Remote Peer'
+                                    ? remoteScreenSharing ? '🖥️ Remote (Screen Share)'
+                                        : pinnedParticipantId
+                                            ? `📌 ${participants.find(p => p.id === pinnedParticipantId)?.name || 'Pinned'}`
+                                            : 'Remote Peer'
                                     : connectionState === 'connecting' ? 'Connecting...'
                                     : connectionState === 'disconnected' ? 'Disconnected'
-                                    : 'Waiting for peer'}
+                                    : participants.filter(p => !p.isHost).length > 0
+                                        ? `Waiting… ${participants.filter(p => !p.isHost).length} participant(s) verified`
+                                        : 'Waiting for peer'}
                             </div>
                             <div className="absolute top-4 right-4">
                                 <div className={`w-3 h-3 rounded-full ${
@@ -1594,6 +1809,106 @@ export default function MeetingRoomPage() {
                                 className="w-full mt-6 py-3 bg-white/10 hover:bg-white/20 rounded-xl transition-all">Close</button>
                         </motion.div>
                     </div>
+                )}
+            </AnimatePresence>
+
+            {/* ── Join Verification Modal (guests only) ────────────────────────── */}
+            <AnimatePresence>
+                {showJoinModal && (
+                    <motion.div
+                        initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+                        className="fixed inset-0 z-[300] bg-black/90 backdrop-blur-md flex items-center justify-center p-4"
+                    >
+                        <motion.div
+                            initial={{ opacity: 0, scale: 0.95, y: 20 }}
+                            animate={{ opacity: 1, scale: 1, y: 0 }}
+                            exit={{ opacity: 0, scale: 0.95, y: 20 }}
+                            className="bg-[#111] w-full max-w-md rounded-3xl border border-white/10 p-8 shadow-2xl"
+                        >
+                            {/* Header */}
+                            <div className="text-center mb-6">
+                                <div className="w-14 h-14 rounded-2xl bg-purple-600/20 border border-purple-500/30 flex items-center justify-center mx-auto mb-4">
+                                    <Shield className="w-7 h-7 text-purple-400" />
+                                </div>
+                                <h2 className="text-2xl font-bold text-white mb-1">Verify to Join</h2>
+                                <p className="text-gray-400 text-sm">
+                                    This is a secure meeting. Please verify your identity to join.
+                                </p>
+                                <div className="mt-2 inline-flex items-center gap-1.5 px-3 py-1 bg-blue-600/10 border border-blue-500/20 rounded-full text-xs text-blue-400">
+                                    <span className="font-mono font-bold">{roomId}</span>
+                                    <span className="text-blue-600">·</span> Secure Room
+                                </div>
+                            </div>
+
+                            {/* Form */}
+                            <div className="space-y-4">
+                                <div>
+                                    <label className="block text-xs text-gray-400 font-medium mb-1.5 uppercase tracking-wider">Full Name</label>
+                                    <input
+                                        type="text"
+                                        placeholder="e.g. Rajesh Kumar"
+                                        value={joinName}
+                                        onChange={e => setJoinName(e.target.value)}
+                                        className="w-full bg-black/50 border border-white/10 rounded-xl px-4 py-3 text-white text-sm focus:outline-none focus:border-purple-500/60 transition-colors placeholder:text-gray-700"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-400 font-medium mb-1.5 uppercase tracking-wider">Email (real or Zoho mail)</label>
+                                    <input
+                                        type="email"
+                                        placeholder="you@zoho.com or you@gmail.com"
+                                        value={joinEmail}
+                                        onChange={e => setJoinEmail(e.target.value)}
+                                        className="w-full bg-black/50 border border-white/10 rounded-xl px-4 py-3 text-white text-sm focus:outline-none focus:border-purple-500/60 transition-colors placeholder:text-gray-700"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-400 font-medium mb-1.5 uppercase tracking-wider">
+                                        Platform Profile ID
+                                    </label>
+                                    <input
+                                        type="text"
+                                        placeholder="TVX-XXX-XXXXXX  (from your Profile page)"
+                                        value={joinProfileId}
+                                        onChange={e => setJoinProfileId(e.target.value.toUpperCase())}
+                                        className="w-full bg-black/50 border border-white/10 rounded-xl px-4 py-3 text-neon-cyan font-mono text-sm focus:outline-none focus:border-purple-500/60 transition-colors placeholder:text-gray-700 placeholder:font-sans"
+                                    />
+                                    <p className="text-[11px] text-gray-600 mt-1.5 flex items-center gap-1">
+                                        <Shield className="w-3 h-3" />
+                                        Your Profile ID is shown on your{' '}
+                                        <a href="/profile" target="_blank" className="text-neon-blue underline">Profile page</a>.
+                                        Format: TVX-ABC-1A2B3C
+                                    </p>
+                                </div>
+
+                                {/* Error */}
+                                {joinError && (
+                                    <div className="flex items-start gap-2 p-3 bg-red-600/10 border border-red-500/30 rounded-xl text-red-400 text-sm">
+                                        <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                                        {joinError}
+                                    </div>
+                                )}
+
+                                {/* Submit */}
+                                <button
+                                    onClick={handleJoinVerification}
+                                    disabled={joinLoading}
+                                    className="w-full py-3.5 bg-gradient-to-r from-purple-600 to-blue-600 hover:from-purple-700 hover:to-blue-700 text-white font-bold rounded-xl transition-all flex items-center justify-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed mt-2"
+                                >
+                                    {joinLoading
+                                        ? <><Loader2 className="w-4 h-4 animate-spin" /> Verifying…</>
+                                        : <><UserCheck className="w-4 h-4" /> Join Meeting</>
+                                    }
+                                </button>
+
+                                <p className="text-center text-xs text-gray-600">
+                                    Don&apos;t have a profile?{' '}
+                                    <a href="/auth/signup" target="_blank" className="text-neon-blue underline">Sign up here</a>
+                                    {' '}to get your Profile ID.
+                                </p>
+                            </div>
+                        </motion.div>
+                    </motion.div>
                 )}
             </AnimatePresence>
 
