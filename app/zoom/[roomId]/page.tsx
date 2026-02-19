@@ -184,8 +184,11 @@ export default function MeetingRoomPage() {
     const [isScreenSharing, setIsScreenSharing] = useState(false);
     const [remoteScreenSharing, setRemoteScreenSharing] = useState(false);
     const [screenSharePending, setScreenSharePending] = useState(false);
-    const [screenShareRequest, setScreenShareRequest] = useState<string | null>(null);
+    // Array of requester names — 1 = auto-approve, 2+ = host must pick
+    const [screenShareRequests, setScreenShareRequests] = useState<string[]>([]);
     const [screenShareApproved, setScreenShareApproved] = useState(false);
+    // Info about the participant currently sharing their screen (remote)
+    const [remoteSharerInfo, setRemoteSharerInfo] = useState<{ name: string; profileId: string } | null>(null);
 
     // ── In-room chat state ────────────────────────────────────────────────────
     const [showChatPanel, setShowChatPanel] = useState(false);
@@ -215,6 +218,12 @@ export default function MeetingRoomPage() {
     const [joinProfileId, setJoinProfileId] = useState('');
     const [joinError, setJoinError] = useState('');
     const [joinLoading, setJoinLoading] = useState(false);
+    // Toast shown when a new participant joins
+    const [newJoinToast, setNewJoinToast] = useState<string | null>(null);
+    // Track previous participant count to detect new arrivals
+    const prevParticipantCountRef = useRef(0);
+    // ID of the current user's own participant entry — used to show "Me" badge
+    const [myParticipantId, setMyParticipantId] = useState<string>('');
 
     const { drmEnabled, drmSettings } = useDRMProtection();
 
@@ -267,10 +276,11 @@ export default function MeetingRoomPage() {
             const hostEmail = session?.email || 'host@trustvaultx.com';
             const hostName = session?.name || 'Host';
             const hostProfileId = session?.profileId || generateProfileId(hostEmail);
-            const alreadyAdded = stored.some(p => p.isHost);
+            const alreadyAdded = stored.find(p => p.isHost);
+            const hostId = alreadyAdded ? alreadyAdded.id : `host-${Date.now()}`;
             const finalList = alreadyAdded ? stored : [
                 {
-                    id: `host-${Date.now()}`,
+                    id: hostId,
                     name: hostName,
                     email: hostEmail,
                     profileId: hostProfileId,
@@ -281,21 +291,99 @@ export default function MeetingRoomPage() {
                 },
                 ...stored.filter(p => !p.isHost),
             ];
+            setMyParticipantId(hostId);          // mark "Me" for host
             setParticipants(finalList);
             localStorage.setItem(storedKey, JSON.stringify(finalList));
+            // Open panel immediately so host can see their own entry + any existing guests
+            setShowParticipantsPanel(true);
         } else {
             // Guest — show join modal, load existing participants
             setParticipants(stored);
+
+            // Auto-populate form from logged-in session so guest just clicks "Join"
+            try {
+                const session = JSON.parse(localStorage.getItem('tvx_session') || 'null');
+                if (session) {
+                    if (session.name) setJoinName(session.name);
+                    if (session.email) setJoinEmail(session.email);
+                    const pid = session.profileId || (session.email ? generateProfileId(session.email) : '');
+                    if (pid) setJoinProfileId(pid.toUpperCase());
+                }
+            } catch (_) {}
+
             setShowJoinModal(true);
         }
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [roomId]);
 
-    // Persist participants on change
+    // Persist participants on change — only writes when data actually changed
+    // so cross-tab storage events don't cause an infinite ping-pong loop.
     useEffect(() => {
         if (!roomId || participants.length === 0) return;
-        localStorage.setItem(`zoom_participants_${roomId}`, JSON.stringify(participants));
+        const key = `zoom_participants_${roomId}`;
+        const next = JSON.stringify(participants);
+        if (localStorage.getItem(key) !== next) {
+            localStorage.setItem(key, next);
+        }
     }, [participants, roomId]);
+
+    // Cross-tab sync: when a guest in another tab adds themselves to localStorage,
+    // the host tab (and other guest tabs) pick it up instantly via the storage event.
+    useEffect(() => {
+        if (!roomId) return;
+        const key = `zoom_participants_${roomId}`;
+        const handler = (e: StorageEvent) => {
+            if (e.key !== key || !e.newValue) return;
+            try {
+                const updated: Participant[] = JSON.parse(e.newValue);
+                setParticipants(updated);
+            } catch (_) {}
+        };
+        window.addEventListener('storage', handler);
+
+        // Polling fallback — catches any cases where the storage event is missed
+        // (e.g. same-origin iframe or browser quirks). Polls every 2 s.
+        const poll = setInterval(() => {
+            try {
+                const raw = localStorage.getItem(key);
+                if (!raw) return;
+                const latest: Participant[] = JSON.parse(raw);
+                setParticipants(prev => {
+                    // Only update if something actually changed (avoid unnecessary re-renders)
+                    if (JSON.stringify(prev) !== JSON.stringify(latest)) return latest;
+                    return prev;
+                });
+            } catch (_) {}
+        }, 2000);
+
+        return () => {
+            window.removeEventListener('storage', handler);
+            clearInterval(poll);
+        };
+    }, [roomId]);
+
+    // ── Auto-open panel + toast when participants list changes ────────────────
+    // Both host AND guest see this — so either side can always see who is in
+    // the meeting without having to manually click the participants button.
+    useEffect(() => {
+        const prev = prevParticipantCountRef.current;
+        const curr = participants.length;
+
+        if (curr > prev && prev > 0) {
+            // Find the newest non-host participant that just arrived
+            const newest = [...participants].reverse().find(p => !p.isHost);
+            if (newest) {
+                const toastMsg = isHost
+                    ? `${newest.name} joined — ${newest.profileId}`
+                    : `You joined as ${newest.name} — ${newest.profileId}`;
+                setNewJoinToast(toastMsg);
+                setTimeout(() => setNewJoinToast(null), 5000);
+            }
+            // Always auto-open the panel on both sides so everyone sees who's here
+            setShowParticipantsPanel(true);
+        }
+        prevParticipantCountRef.current = curr;
+    }, [participants, isHost]);
 
     // ── Participant management ─────────────────────────────────────────────────
     const handleJoinVerification = () => {
@@ -320,9 +408,23 @@ export default function MeetingRoomPage() {
                 screenShareAllowed: false,
                 isPinned: false,
             };
-            setParticipants(prev => [...prev, newParticipant]);
+
+            // Write to localStorage synchronously BEFORE updating React state.
+            // This fires the cross-tab storage event immediately so the host tab
+            // sees this new participant without waiting for React's async effect cycle.
+            const key = `zoom_participants_${roomId}`;
+            const existing: Participant[] = (() => {
+                try { return JSON.parse(localStorage.getItem(key) || '[]'); } catch { return []; }
+            })();
+            const updated = [...existing, newParticipant];
+            localStorage.setItem(key, JSON.stringify(updated));
+
+            setMyParticipantId(newParticipant.id);  // mark "Me" for guest
+            setParticipants(updated);
             setShowJoinModal(false);
             setJoinLoading(false);
+            // Open the panel so the guest immediately sees all participants (host + themselves)
+            setShowParticipantsPanel(true);
         }, 800);
     };
 
@@ -372,12 +474,18 @@ export default function MeetingRoomPage() {
                         break;
                     case 'screen-share-start':
                         setRemoteScreenSharing(true);
+                        // Track who is sharing for per-participant watermark
+                        if (msg.sharerName) {
+                            setRemoteSharerInfo({ name: msg.sharerName, profileId: msg.sharerProfileId || '' });
+                        }
                         break;
                     case 'screen-share-stop':
                         setRemoteScreenSharing(false);
+                        setRemoteSharerInfo(null);
                         break;
                     case 'screen-share-request':
-                        setScreenShareRequest(msg.sender || 'Remote peer');
+                        // Add to requests array — auto-approve if single, host picks if multiple
+                        setScreenShareRequests(prev => [...prev, msg.sender || 'Remote peer']);
                         break;
                     case 'screen-share-approve':
                         setScreenSharePending(false);
@@ -768,6 +876,40 @@ export default function MeetingRoomPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [screenShareApproved]);
 
+    // ── Effect 14: Auto-approve single screen share request ───────────────────
+    // If only one participant requests → host auto-approves after 0.6 s.
+    // If two or more arrive within that window → host must manually pick one.
+    useEffect(() => {
+        if (screenShareRequests.length !== 1) return;
+        const timer = setTimeout(() => {
+            setScreenShareRequests(curr => {
+                if (curr.length === 1) {
+                    // Still just one → auto-approve
+                    sendDataMessage({ type: 'screen-share-approve' });
+                    return [];
+                }
+                return curr; // Multiple arrived — let host decide
+            });
+        }, 600);
+        return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [screenShareRequests.length]);
+
+    // ── Effect 15: Update recording watermark when remote sharer changes ──────
+    // Whoever is sharing screen gets their identity stamped on the recording canvas.
+    useEffect(() => {
+        if (remoteSharerInfo) {
+            // Remote participant is sharing — show their identity in the recording
+            const label = `🖥️ ${remoteSharerInfo.name} (${remoteSharerInfo.profileId || 'N/A'}) • SHARING • ROOM-${roomId}`;
+            wmControlRef.current?.(drmSettings.watermarkOverlay, label, recWmConfigRef.current);
+        } else if (!isScreenSharing) {
+            // No one is sharing — revert to room-level watermark
+            const defaultLabel = `🔒 ${sessionFingerprint || roomId} • ROOM-${roomId} • PROTECTED`;
+            wmControlRef.current?.(drmSettings.watermarkOverlay, defaultLabel, recWmConfigRef.current);
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [remoteSharerInfo, isScreenSharing]);
+
     // ── Mixed Recording: Canvas + AudioContext ────────────────────────────────
     const createMixedStream = (): MediaStream | null => {
         try {
@@ -934,7 +1076,17 @@ export default function MeetingRoomPage() {
             if (localVideoRef.current) localVideoRef.current.srcObject = screenStream;
 
             setIsScreenSharing(true);
-            sendDataMessage({ type: 'screen-share-start' });
+
+            // Stamp recording watermark with the sharer's own identity
+            const mySession = (() => {
+                try { return JSON.parse(localStorage.getItem('tvx_session') || 'null'); } catch { return null; }
+            })();
+            const myName = mySession?.name || 'User';
+            const myProfileId = mySession?.profileId || (mySession?.email ? generateProfileId(mySession.email) : roomId);
+            const sharerLabel = `🖥️ ${myName} (${myProfileId}) • SHARING • ROOM-${roomId}`;
+            wmControlRef.current?.(drmSettings.watermarkOverlay, sharerLabel, recWmConfigRef.current);
+
+            sendDataMessage({ type: 'screen-share-start', sharerName: myName, sharerProfileId: myProfileId });
 
             // User stops sharing via browser native button
             videoTrack.onended = () => stopScreenShare();
@@ -967,16 +1119,26 @@ export default function MeetingRoomPage() {
 
         setIsScreenSharing(false);
         sendDataMessage({ type: 'screen-share-stop' });
+
+        // Revert watermark to room-level default
+        const defaultLabel = `🔒 ${sessionFingerprint || roomId} • ROOM-${roomId} • PROTECTED`;
+        wmControlRef.current?.(drmSettings.watermarkOverlay, defaultLabel, recWmConfigRef.current);
     };
 
-    const approveScreenShare = () => {
+    // Approve one specific requester (or the only one) and clear the queue
+    const approveScreenShare = (requester?: string) => {
         sendDataMessage({ type: 'screen-share-approve' });
-        setScreenShareRequest(null);
+        setScreenShareRequests(prev =>
+            requester ? prev.filter(r => r !== requester) : []
+        );
     };
 
-    const denyScreenShare = () => {
+    // Deny one specific requester (or all) and clear the queue
+    const denyScreenShare = (requester?: string) => {
         sendDataMessage({ type: 'screen-share-deny' });
-        setScreenShareRequest(null);
+        setScreenShareRequests(prev =>
+            requester ? prev.filter(r => r !== requester) : []
+        );
     };
 
     // ── In-room Chat ──────────────────────────────────────────────────────────
@@ -1182,6 +1344,16 @@ export default function MeetingRoomPage() {
     const participantCount = Math.max(participants.length, connectionState === 'connected' ? 2 : 1);
     const activeMessages = chatTab === 'group' ? groupMessages : chatTab === 'private' ? privateMessages : [];
 
+    // Derive "me" and "remote" participant info for video tile labels
+    const myParticipant = participants.find(p => p.id === myParticipantId);
+    const myLabel = myParticipant
+        ? `${myParticipant.name}${myParticipant.isHost ? ' (Host)' : ''}${!micEnabled ? ' · muted' : ''}`
+        : `You${!micEnabled ? ' (muted)' : ''}`;
+    const remoteParticipant = participants.find(p => p.id !== myParticipantId && participants.length > 0);
+    const remoteLabel = remoteParticipant
+        ? `${remoteParticipant.name}${remoteParticipant.isHost ? ' (Host)' : ''} · ${remoteParticipant.profileId}`
+        : 'Remote Peer';
+
     // ── Render ─────────────────────────────────────────────────────────────────
     return (
         <div className="min-h-screen bg-[#0a0a0f] text-white font-sans flex flex-col">
@@ -1235,19 +1407,48 @@ export default function MeetingRoomPage() {
                 )}
             </AnimatePresence>
 
-            {/* Screen Share Request (host sees) */}
+            {/* New participant joined toast (host only) */}
             <AnimatePresence>
-                {screenShareRequest && (
+                {newJoinToast && (
                     <motion.div initial={{ opacity: 0, x: 100 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 100 }}
-                        className="fixed top-24 right-6 z-[110] bg-[#1a1a2e] border border-purple-500/40 rounded-2xl p-4 shadow-2xl w-72">
-                        <div className="flex items-center gap-2 mb-2">
-                            <Monitor className="w-4 h-4 text-purple-400" />
-                            <p className="text-sm font-semibold">Screen Share Request</p>
+                        className="fixed top-24 right-6 z-[105] bg-blue-700/90 backdrop-blur-sm px-5 py-3 rounded-2xl flex items-center gap-3 shadow-xl border border-blue-500/30 max-w-xs">
+                        <Users className="w-5 h-5 text-blue-200 shrink-0" />
+                        <div className="min-w-0">
+                            <p className="text-sm font-semibold text-white">New participant joined!</p>
+                            <p className="text-xs text-blue-200 truncate">{newJoinToast}</p>
                         </div>
-                        <p className="text-xs text-gray-400 mb-3">{screenShareRequest} wants to share their screen</p>
-                        <div className="flex gap-2">
-                            <button onClick={approveScreenShare} className="flex-1 py-2 bg-green-600/20 text-green-400 rounded-lg text-sm hover:bg-green-600/30 border border-green-500/20 transition-colors">✓ Allow</button>
-                            <button onClick={denyScreenShare} className="flex-1 py-2 bg-red-600/20 text-red-400 rounded-lg text-sm hover:bg-red-600/30 border border-red-500/20 transition-colors">✕ Deny</button>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
+            {/* Screen Share Requests (host sees) — auto-approves 1, picks from 2+ */}
+            <AnimatePresence>
+                {screenShareRequests.length >= 2 && (
+                    <motion.div initial={{ opacity: 0, x: 100 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 100 }}
+                        className="fixed top-24 right-6 z-[110] bg-[#1a1a2e] border border-orange-500/40 rounded-2xl p-4 shadow-2xl w-80">
+                        <div className="flex items-center gap-2 mb-1">
+                            <Monitor className="w-4 h-4 text-orange-400" />
+                            <p className="text-sm font-semibold text-orange-300">Multiple Screen Share Requests</p>
+                        </div>
+                        <p className="text-xs text-gray-400 mb-3">
+                            {screenShareRequests.length} participants want to share. Choose one:
+                        </p>
+                        <div className="space-y-2">
+                            {screenShareRequests.map((requester, i) => (
+                                <div key={i} className="flex items-center gap-2 bg-white/5 rounded-xl px-3 py-2">
+                                    <span className="text-xs text-gray-300 flex-1 truncate">{requester}</span>
+                                    <button
+                                        onClick={() => approveScreenShare(requester)}
+                                        className="px-2 py-1 bg-green-600/20 text-green-400 rounded-lg text-xs hover:bg-green-600/30 border border-green-500/20 transition-colors">
+                                        ✓ Allow
+                                    </button>
+                                    <button
+                                        onClick={() => denyScreenShare(requester)}
+                                        className="px-2 py-1 bg-red-600/20 text-red-400 rounded-lg text-xs hover:bg-red-600/30 border border-red-500/20 transition-colors">
+                                        ✕
+                                    </button>
+                                </div>
+                            ))}
                         </div>
                     </motion.div>
                 )}
@@ -1282,11 +1483,15 @@ export default function MeetingRoomPage() {
                             </div>
                             <button
                                 onClick={() => setShowParticipantsPanel(p => !p)}
-                                className={`flex items-center gap-2 text-sm px-3 py-1.5 rounded-lg border transition-all ${showParticipantsPanel ? 'bg-purple-600/20 border-purple-500/40 text-purple-300' : 'text-gray-400 border-white/10 hover:bg-white/5'}`}
+                                className={`relative flex items-center gap-2 text-sm px-3 py-1.5 rounded-lg border transition-all ${showParticipantsPanel ? 'bg-purple-600/20 border-purple-500/40 text-purple-300' : 'text-gray-400 border-white/10 hover:bg-white/5'}`}
                             >
                                 <Users className="w-4 h-4" />
                                 {participantCount} participant{participantCount > 1 ? 's' : ''}
                                 <ChevronDown className={`w-3 h-3 transition-transform ${showParticipantsPanel ? 'rotate-180' : ''}`} />
+                                {/* Green pulse dot — lights up when a new participant joins */}
+                                {newJoinToast && !showParticipantsPanel && (
+                                    <span className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-green-500 rounded-full animate-pulse" />
+                                )}
                             </button>
                         </div>
                         <div className="flex items-center gap-2">
@@ -1331,25 +1536,29 @@ export default function MeetingRoomPage() {
                             >
                                 <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between">
                                     <span className="text-sm font-bold flex items-center gap-2">
-                                        <Users className="w-4 h-4 text-purple-400" /> Participants ({participants.length})
+                                        <Users className="w-4 h-4 text-purple-400" /> In this meeting ({participants.length})
                                     </span>
-                                    {isHost && (
-                                        <span className="text-xs text-gray-500">As host you can grant/revoke screen share access</span>
-                                    )}
+                                    <span className="text-xs text-gray-500">
+                                        {isHost ? 'Host · grant/revoke screen share per participant' : 'Verified participants'}
+                                    </span>
                                 </div>
                                 <div className="divide-y divide-white/5 max-h-52 overflow-y-auto">
                                     {participants.length === 0 ? (
                                         <div className="px-4 py-6 text-center text-gray-600 text-sm">No verified participants yet.</div>
                                     ) : participants.map(p => (
-                                        <div key={p.id} className={`flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition-colors group ${p.isPinned ? 'bg-purple-600/10 border-l-2 border-purple-500' : ''}`}>
+                                        <div key={p.id} className={`flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition-colors group ${p.isPinned ? 'bg-purple-600/10 border-l-2 border-purple-500' : ''} ${p.id === myParticipantId ? 'bg-green-900/10' : ''}`}>
                                             {/* Avatar */}
-                                            <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold border shrink-0 ${p.isHost ? 'bg-purple-600/30 border-purple-500/40 text-purple-300' : 'bg-blue-600/20 border-blue-500/30 text-blue-300'}`}>
+                                            <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold border shrink-0 ${p.isHost ? 'bg-purple-600/30 border-purple-500/40 text-purple-300' : p.id === myParticipantId ? 'bg-green-600/30 border-green-500/40 text-green-300' : 'bg-blue-600/20 border-blue-500/30 text-blue-300'}`}>
                                                 {p.name.charAt(0).toUpperCase()}
                                             </div>
                                             {/* Info */}
                                             <div className="flex-1 min-w-0">
-                                                <div className="flex items-center gap-2">
+                                                <div className="flex items-center gap-2 flex-wrap">
                                                     <span className="text-sm font-medium text-white truncate">{p.name}</span>
+                                                    {/* "Me" badge — shown only to the current user for their own row */}
+                                                    {p.id === myParticipantId && (
+                                                        <span className="text-[10px] px-1.5 py-0.5 bg-green-600/20 text-green-400 border border-green-500/30 rounded font-bold">Me</span>
+                                                    )}
                                                     {p.isHost && <span className="text-[10px] px-1.5 py-0.5 bg-purple-600/20 text-purple-400 border border-purple-500/30 rounded font-bold">HOST</span>}
                                                     {p.isPinned && <span className="text-[10px] text-purple-400">📌</span>}
                                                 </div>
@@ -1420,8 +1629,9 @@ export default function MeetingRoomPage() {
                                     <div className="w-24 h-24 rounded-full bg-blue-600 flex items-center justify-center text-3xl font-bold">Y</div>
                                 </div>
                             )}
-                            <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-sm px-3 py-1 rounded-lg text-sm">
-                                {isScreenSharing ? '🖥️ You (Screen Share)' : `You${!micEnabled ? ' (muted)' : ''}`}
+                            <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-sm px-3 py-1 rounded-lg text-sm flex items-center gap-1.5">
+                                <span className="text-[10px] bg-green-600/70 text-white px-1.5 py-0.5 rounded font-bold">Me</span>
+                                {isScreenSharing ? `🖥️ ${myParticipant?.name || 'You'} · Sharing` : myLabel}
                             </div>
                             {isScreenSharing && (
                                 <div className="absolute top-3 right-3 bg-blue-600/80 text-white text-xs px-2 py-1 rounded-full flex items-center gap-1">
@@ -1493,17 +1703,27 @@ export default function MeetingRoomPage() {
                                     </div>
                                 </div>
                             )}
-                            <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-sm px-3 py-1 rounded-lg text-sm">
-                                {connectionState === 'connected'
-                                    ? remoteScreenSharing ? '🖥️ Remote (Screen Share)'
-                                        : pinnedParticipantId
-                                            ? `📌 ${participants.find(p => p.id === pinnedParticipantId)?.name || 'Pinned'}`
-                                            : 'Remote Peer'
-                                    : connectionState === 'connecting' ? 'Connecting...'
-                                    : connectionState === 'disconnected' ? 'Disconnected'
-                                    : participants.filter(p => !p.isHost).length > 0
-                                        ? `Waiting… ${participants.filter(p => !p.isHost).length} participant(s) verified`
-                                        : 'Waiting for peer'}
+                            <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-sm px-3 py-1 rounded-lg text-sm flex items-center gap-1.5">
+                                {connectionState === 'connected' && remoteParticipant && (
+                                    <span className="text-[10px] bg-blue-600/70 text-white px-1.5 py-0.5 rounded font-bold shrink-0">
+                                        {remoteParticipant.isHost ? 'Host' : 'Guest'}
+                                    </span>
+                                )}
+                                <span>
+                                    {connectionState === 'connected'
+                                        ? remoteScreenSharing
+                                            ? remoteSharerInfo
+                                                ? `🖥️ ${remoteSharerInfo.name} (${remoteSharerInfo.profileId}) · Sharing`
+                                                : '🖥️ Remote (Screen Share)'
+                                            : pinnedParticipantId
+                                                ? `📌 ${participants.find(p => p.id === pinnedParticipantId)?.name || 'Pinned'}`
+                                                : remoteLabel
+                                        : connectionState === 'connecting' ? 'Connecting...'
+                                        : connectionState === 'disconnected' ? 'Disconnected'
+                                        : participants.filter(p => p.id !== myParticipantId).length > 0
+                                            ? `Waiting… ${participants.filter(p => p.id !== myParticipantId).length} verified`
+                                            : 'Waiting for peer'}
+                                </span>
                             </div>
                             <div className="absolute top-4 right-4">
                                 <div className={`w-3 h-3 rounded-full ${
