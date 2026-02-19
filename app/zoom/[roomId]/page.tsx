@@ -31,6 +31,30 @@ interface InRoomMsg {
     timestamp: number;
 }
 
+// ── Recording watermark config (mirrors GlobalNavbar export) ─────────────────
+interface RecordingWmConfig {
+    text: string; fontSize: number; color: string; opacity: number;
+    bgColor: string; bgOpacity: number; rotation: number;
+    repeat: boolean; spacingX: number; spacingY: number;
+    offsetX: number; offsetY: number;
+    // Logo layer — independent of text
+    logoDataUrl: string; logoSize: number; logoOpacity: number;
+    logoOffsetX: number; logoOffsetY: number;
+    logoRepeat: boolean; logoSpacingX: number; logoSpacingY: number; logoRotation: number;
+}
+const DEFAULT_REC_WM: RecordingWmConfig = {
+    text: '', fontSize: 20, color: '#ffffff', opacity: 0.85,
+    bgColor: '#000000', bgOpacity: 0.65, rotation: -30,
+    repeat: true, spacingX: 380, spacingY: 120, offsetX: 0, offsetY: 0,
+    logoDataUrl: '', logoSize: 48, logoOpacity: 0.85,
+    logoOffsetX: 0, logoOffsetY: 0,
+    logoRepeat: false, logoSpacingX: 300, logoSpacingY: 200, logoRotation: 0,
+};
+const hexToRgbNums = (hex: string): [number, number, number] => {
+    const h = hex.replace('#', '').padEnd(6, '0');
+    return [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)];
+};
+
 // ── Reaction definitions ───────────────────────────────────────────────────────
 type ReactionKey = 'agree' | 'thumbsup' | 'clap' | 'disagree' | 'heart' | 'hand';
 const REACTION_EMOJIS: Record<ReactionKey, string> = {
@@ -121,9 +145,8 @@ export default function MeetingRoomPage() {
     const chatEndRef = useRef<HTMLDivElement>(null);
 
     // ── Watermark closure-control ref ────────────────────────────────────────
-    // createMixedStream stores a setter here that directly mutates the local
-    // closure variables — zero async delay, no stale refs.
-    const wmControlRef = useRef<((active: boolean, label: string) => void) | null>(null);
+    const wmControlRef = useRef<((active: boolean, label: string, cfg: RecordingWmConfig) => void) | null>(null);
+    const recWmConfigRef = useRef<RecordingWmConfig>(DEFAULT_REC_WM);
 
     // ── Core state ────────────────────────────────────────────────────────────
     const [stream, setStream] = useState<MediaStream | null>(null);
@@ -142,6 +165,7 @@ export default function MeetingRoomPage() {
     const [drmViolationCount, setDrmViolationCount] = useState(0);
     const [advancedDRMActive, setAdvancedDRMActive] = useState(false);
     const [isEndingCall, setIsEndingCall] = useState(false);
+    const [recWmConfig, setRecWmConfig] = useState<RecordingWmConfig>(DEFAULT_REC_WM);
 
     // ── Screen-share state ────────────────────────────────────────────────────
     const [isScreenSharing, setIsScreenSharing] = useState(false);
@@ -168,13 +192,32 @@ export default function MeetingRoomPage() {
 
     const { drmEnabled, drmSettings } = useDRMProtection();
 
-    // ── Push live DRM watermark toggle into the recording canvas closure ──────
-    // Calls the setter stored by createMixedStream — updates take effect within
-    // the very next RAF frame (~16 ms), no stale closure issues.
+    // ── Load recording watermark config from localStorage + listen for updates ─
     useEffect(() => {
+        if (typeof window === 'undefined') return;
+        const saved = localStorage.getItem('recWmConfig');
+        if (saved) {
+            try {
+                const cfg = { ...DEFAULT_REC_WM, ...JSON.parse(saved) };
+                setRecWmConfig(cfg);
+                recWmConfigRef.current = cfg;
+            } catch (_) {}
+        }
+        const handler = (e: Event) => {
+            const cfg = { ...DEFAULT_REC_WM, ...(e as CustomEvent<RecordingWmConfig>).detail };
+            setRecWmConfig(cfg);
+            recWmConfigRef.current = cfg;
+        };
+        window.addEventListener('recWmConfigChanged', handler);
+        return () => window.removeEventListener('recWmConfigChanged', handler);
+    }, []);
+
+    // ── Push watermark toggle + config into the recording canvas closure ───────
+    useEffect(() => {
+        recWmConfigRef.current = recWmConfig;
         const label = `🔒 ${sessionFingerprint || roomId} • ROOM-${roomId} • PROTECTED`;
-        wmControlRef.current?.(drmSettings.watermarkOverlay, label);
-    }, [drmSettings.watermarkOverlay, sessionFingerprint, roomId]);
+        wmControlRef.current?.(drmSettings.watermarkOverlay, label, recWmConfig);
+    }, [drmSettings.watermarkOverlay, recWmConfig, sessionFingerprint, roomId]);
 
     // ── Floating reaction animation ───────────────────────────────────────────
     const addFloatingReaction = useCallback((emoji: string) => {
@@ -608,12 +651,26 @@ export default function MeetingRoomPage() {
             if (!localVid) return null;
 
             // ── Closure-local watermark state ────────────────────────────────
-            // Captured at recording-start time; updated in real-time via wmControlRef.
             let wmActive = drmSettings.watermarkOverlay;
             let wmLabel = `🔒 ${sessionFingerprint || roomId} • ROOM-${roomId} • PROTECTED`;
-            wmControlRef.current = (active: boolean, label: string) => {
+            let wmCfg: RecordingWmConfig = { ...recWmConfigRef.current };
+            // Pre-load logo
+            let logoImage: HTMLImageElement | null = null;
+            let currentLogoSrc = '';
+            const loadLogo = (src: string) => {
+                if (src === currentLogoSrc) return;
+                currentLogoSrc = src;
+                if (!src) { logoImage = null; return; }
+                const img = new Image();
+                img.onload = () => { logoImage = img; };
+                img.src = src;
+            };
+            if (wmCfg.logoDataUrl) loadLogo(wmCfg.logoDataUrl);
+            wmControlRef.current = (active: boolean, label: string, cfg: RecordingWmConfig) => {
                 wmActive = active;
                 wmLabel = label;
+                wmCfg = cfg;
+                loadLogo(cfg.logoDataUrl);
             };
 
             const canvas = document.createElement('canvas');
@@ -629,32 +686,69 @@ export default function MeetingRoomPage() {
                 if (localVid.readyState >= 2) ctx.drawImage(localVid, 0, 0, 640, 720);
                 if (remoteVid && remoteVid.readyState >= 2) ctx.drawImage(remoteVid, 640, 0, 640, 720);
 
-                // ── Watermark burned into recording canvas ───────────────────
+                // ── Recording watermark (fully config-driven) ────────────────
                 if (wmActive) {
+                    const cfg = wmCfg;
+                    const displayText = cfg.text.trim() || wmLabel;
+                    const [br, bg2, bb] = hexToRgbNums(cfg.bgColor);
+                    const [tr, tg, tb] = hexToRgbNums(cfg.color);
+                    const rotRad = (cfg.rotation * Math.PI) / 180;
+
+                    // ── Text layer ──────────────────────────────────────────────
                     ctx.save();
-                    ctx.translate(640, 360);
-                    ctx.rotate(-30 * Math.PI / 180);
-                    ctx.font = 'bold 18px monospace';
+                    ctx.font = `bold ${cfg.fontSize}px monospace`;
                     ctx.textAlign = 'center';
                     ctx.textBaseline = 'middle';
-                    for (let row = -1; row <= 2; row++) {
-                        for (let col = -1; col <= 1; col++) {
-                            const x = col * 380;
-                            const y = row * 130 - 65;
-                            const metrics = ctx.measureText(wmLabel);
-                            const pw = metrics.width + 18;
-                            const ph = 28;
-                            ctx.globalAlpha = 0.72;
-                            ctx.fillStyle = '#000000';
+
+                    const drawTextOne = (cx: number, cy: number) => {
+                        ctx.save();
+                        ctx.translate(cx, cy);
+                        ctx.rotate(rotRad);
+                        const metrics = ctx.measureText(displayText);
+                        const pw = metrics.width + 18;
+                        const ph = Math.max(cfg.fontSize + 10, 28);
+                        if (cfg.bgOpacity > 0) {
+                            ctx.globalAlpha = cfg.bgOpacity;
+                            ctx.fillStyle = `rgb(${br},${bg2},${bb})`;
                             ctx.beginPath();
-                            ctx.roundRect(x - pw / 2, y - ph / 2, pw, ph, 6);
+                            ctx.roundRect(-pw / 2, -ph / 2, pw, ph, 6);
                             ctx.fill();
-                            ctx.globalAlpha = 0.9;
-                            ctx.fillStyle = '#ffffff';
-                            ctx.fillText(wmLabel, x, y);
                         }
+                        ctx.globalAlpha = cfg.opacity;
+                        ctx.fillStyle = `rgb(${tr},${tg},${tb})`;
+                        ctx.fillText(displayText, 0, 0);
+                        ctx.restore();
+                    };
+
+                    if (cfg.repeat) {
+                        for (let row = -1; row <= 2; row++)
+                            for (let col = -1; col <= 2; col++)
+                                drawTextOne(col * cfg.spacingX, row * cfg.spacingY);
+                    } else {
+                        drawTextOne(640 + (cfg.offsetX / 100) * 1280, 360 + (cfg.offsetY / 100) * 720);
                     }
                     ctx.restore();
+
+                    // ── Logo layer (independent) ────────────────────────────────
+                    if (cfg.logoDataUrl && logoImage) {
+                        const logoRotRad = (cfg.logoRotation * Math.PI) / 180;
+                        const drawLogoOne = (cx: number, cy: number) => {
+                            ctx.save();
+                            ctx.translate(cx, cy);
+                            ctx.rotate(logoRotRad);
+                            ctx.globalAlpha = cfg.logoOpacity;
+                            ctx.drawImage(logoImage!, -cfg.logoSize / 2, -cfg.logoSize / 2, cfg.logoSize, cfg.logoSize);
+                            ctx.restore();
+                        };
+                        if (cfg.logoRepeat) {
+                            for (let row = -1; row <= 2; row++)
+                                for (let col = -1; col <= 2; col++)
+                                    drawLogoOne(col * cfg.logoSpacingX, row * cfg.logoSpacingY);
+                        } else {
+                            drawLogoOne(640 + (cfg.logoOffsetX / 100) * 1280, 360 + (cfg.logoOffsetY / 100) * 720);
+                        }
+                    }
+
                     ctx.globalAlpha = 1;
                 }
 
@@ -1125,26 +1219,28 @@ export default function MeetingRoomPage() {
                                 </div>
                             )}
                             {drmSettings.watermarkOverlay && (
+                                /* Live-meeting overlay: translucent blend — subtle during call but
+                                   extremely hard to remove from phone recordings because the text
+                                   colour shifts with the underlying video content (mix-blend-mode). */
                                 <div className="absolute inset-0 pointer-events-none" style={{ zIndex: 10 }}>
                                     {([
-                                        [15, 10], [50, 10], [85, 10],
-                                        [15, 45], [50, 45], [85, 45],
-                                        [15, 80], [50, 80], [85, 80],
+                                        [18, 12], [55, 8],  [88, 18],
+                                        [10, 45], [48, 42], [82, 50],
+                                        [22, 78], [60, 72], [90, 85],
                                     ] as [number, number][]).map(([left, top], i) => (
                                         <div key={i} style={{
                                             position: 'absolute',
                                             left: `${left}%`,
                                             top: `${top}%`,
-                                            transform: 'translate(-50%, -50%) rotate(-30deg)',
-                                            color: 'rgba(255,255,255,0.9)',
-                                            fontSize: '13px',
-                                            fontWeight: 'bold',
+                                            transform: 'translate(-50%, -50%) rotate(-18deg)',
+                                            color: 'rgba(255, 60, 60, 0.22)',
+                                            fontSize: '11px',
+                                            fontWeight: '700',
                                             fontFamily: 'monospace',
                                             whiteSpace: 'nowrap',
                                             userSelect: 'none',
-                                            backgroundColor: 'rgba(0,0,0,0.72)',
-                                            borderRadius: '4px',
-                                            padding: '3px 8px',
+                                            letterSpacing: '0.04em',
+                                            mixBlendMode: 'overlay' as const,
                                         }}>
                                             🔒 {sessionFingerprint || roomId} • PROTECTED
                                         </div>

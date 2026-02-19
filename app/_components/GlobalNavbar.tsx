@@ -5,6 +5,42 @@ import Link from 'next/link';
 import { motion } from 'framer-motion';
 import { Shield, User, LogIn, LayoutDashboard, X, Video, Eye, EyeOff, Monitor, Lock, Unlock, VideoOff, Tv, Fingerprint, Activity } from 'lucide-react';
 
+// ── Recording watermark config ────────────────────────────────────────────────
+export interface RecordingWmConfig {
+    // ── Text layer ───────────────────────────────────────────────────────
+    text: string;        // custom text, '' = session fingerprint
+    fontSize: number;    // 10-48 px
+    color: string;       // hex
+    opacity: number;     // 0.1 – 1.0
+    bgColor: string;     // hex
+    bgOpacity: number;   // 0 = transparent (no pill)
+    rotation: number;    // -90 to 90 °
+    repeat: boolean;
+    spacingX: number;    // tile spacing X  (repeat mode)
+    spacingY: number;    // tile spacing Y  (repeat mode)
+    offsetX: number;     // % from centre   (single mode)
+    offsetY: number;     // % from centre   (single mode)
+    // ── Logo layer (independent of text) ────────────────────────────────
+    logoDataUrl: string; // base64 data URL, '' = none
+    logoSize: number;    // 16 – 120 px
+    logoOpacity: number; // 0.1 – 1.0
+    logoOffsetX: number; // % from centre X (single mode)
+    logoOffsetY: number; // % from centre Y (single mode)
+    logoRepeat: boolean;
+    logoSpacingX: number;// tile spacing X  (logo repeat)
+    logoSpacingY: number;// tile spacing Y  (logo repeat)
+    logoRotation: number;// -90 to 90 ° (independent)
+}
+export const DEFAULT_REC_WM: RecordingWmConfig = {
+    text: '', fontSize: 20, color: '#ffffff', opacity: 0.85,
+    bgColor: '#000000', bgOpacity: 0.65, rotation: -30,
+    repeat: true, spacingX: 380, spacingY: 120,
+    offsetX: 0, offsetY: 0,
+    logoDataUrl: '', logoSize: 48, logoOpacity: 0.85,
+    logoOffsetX: 0, logoOffsetY: 0,
+    logoRepeat: false, logoSpacingX: 300, logoSpacingY: 200, logoRotation: 0,
+};
+
 const GlobalNavbar = () => {
     const [isDRMModalOpen, setIsDRMModalOpen] = useState(false);
     const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
@@ -24,12 +60,17 @@ const GlobalNavbar = () => {
         heartbeatProtection: true
     });
 
+    const [recWmConfig, setRecWmConfig] = useState<RecordingWmConfig>(DEFAULT_REC_WM);
+    const [showRecWm, setShowRecWm] = useState(false);
+
     // Load settings from localStorage
     useEffect(() => {
         if (typeof window !== 'undefined') {
             const saved = localStorage.getItem('drmSettings');
-            if (saved) {
-                setDrmSettings(JSON.parse(saved));
+            if (saved) setDrmSettings(JSON.parse(saved));
+            const savedRec = localStorage.getItem('recWmConfig');
+            if (savedRec) {
+                try { setRecWmConfig({ ...DEFAULT_REC_WM, ...JSON.parse(savedRec) }); } catch (_) {}
             }
         }
     }, []);
@@ -43,6 +84,13 @@ const GlobalNavbar = () => {
 
         // Dispatch custom event immediately so Zoom room updates in real-time
         window.dispatchEvent(new CustomEvent('drmSettingsChanged', { detail: newSettings }));
+    };
+
+    const updateRecWm = (updates: Partial<RecordingWmConfig>) => {
+        const newCfg = { ...recWmConfig, ...updates };
+        setRecWmConfig(newCfg);
+        try { localStorage.setItem('recWmConfig', JSON.stringify(newCfg)); } catch (_) {}
+        window.dispatchEvent(new CustomEvent('recWmConfigChanged', { detail: newCfg }));
     };
 
     // Scroll tracking for hide/show and glassmorphism
@@ -336,6 +384,232 @@ const GlobalNavbar = () => {
                                     <div className={`w-5 h-5 bg-white rounded-full transition-transform ${drmSettings.watermarkOverlay ? 'translate-x-6' : 'translate-x-0.5'}`} />
                                 </button>
                             </div>
+
+                            {/* Recording Watermark Customisation Panel */}
+                            {drmSettings.watermarkOverlay && (
+                                <div className="bg-orange-950/20 border border-orange-500/10 rounded-xl overflow-hidden">
+                                    <button
+                                        onClick={() => setShowRecWm(p => !p)}
+                                        className="w-full flex items-center justify-between px-4 py-2.5 text-sm text-orange-400 hover:bg-orange-500/10 transition-colors"
+                                    >
+                                        <span className="font-medium">🎬 Recording Watermark Settings</span>
+                                        <span className="text-orange-600 text-xs">{showRecWm ? '▲ Hide' : '▼ Customize'}</span>
+                                    </button>
+
+                                    {showRecWm && (
+                                        <div className="px-4 pb-4 space-y-4 border-t border-orange-500/10">
+                                            {/* Custom text */}
+                                            <div className="pt-3">
+                                                <label className="text-xs text-gray-400 mb-1 block">Custom Text <span className="text-gray-600">(empty = session fingerprint)</span></label>
+                                                <input type="text" value={recWmConfig.text}
+                                                    onChange={e => updateRecWm({ text: e.target.value })}
+                                                    placeholder="e.g. CONFIDENTIAL • My Company"
+                                                    className="w-full bg-black/40 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-orange-500/50" />
+                                            </div>
+
+                                            {/* Text color + opacity */}
+                                            <div className="grid grid-cols-2 gap-3">
+                                                <div>
+                                                    <label className="text-xs text-gray-400 mb-2 block">Text Color</label>
+                                                    <div className="flex items-center gap-2">
+                                                        <input type="color" value={recWmConfig.color}
+                                                            onChange={e => updateRecWm({ color: e.target.value })}
+                                                            className="w-9 h-8 rounded cursor-pointer border border-white/10 bg-transparent" />
+                                                        <code className="text-xs text-gray-500">{recWmConfig.color}</code>
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <label className="text-xs text-gray-400 mb-1 block">Opacity: {Math.round(recWmConfig.opacity * 100)}%</label>
+                                                    <input type="range" min="0.1" max="1" step="0.05" value={recWmConfig.opacity}
+                                                        onChange={e => updateRecWm({ opacity: parseFloat(e.target.value) })}
+                                                        className="w-full accent-orange-500 mt-2" />
+                                                </div>
+                                            </div>
+
+                                            {/* Font size + rotation */}
+                                            <div className="grid grid-cols-2 gap-3">
+                                                <div>
+                                                    <label className="text-xs text-gray-400 mb-1 block">Font Size: {recWmConfig.fontSize}px</label>
+                                                    <input type="range" min="10" max="48" step="1" value={recWmConfig.fontSize}
+                                                        onChange={e => updateRecWm({ fontSize: parseInt(e.target.value) })}
+                                                        className="w-full accent-orange-500 mt-2" />
+                                                </div>
+                                                <div>
+                                                    <label className="text-xs text-gray-400 mb-1 block">Rotation: {recWmConfig.rotation}°</label>
+                                                    <input type="range" min="-90" max="90" step="5" value={recWmConfig.rotation}
+                                                        onChange={e => updateRecWm({ rotation: parseInt(e.target.value) })}
+                                                        className="w-full accent-orange-500 mt-2" />
+                                                </div>
+                                            </div>
+
+                                            {/* Background */}
+                                            <div className="grid grid-cols-2 gap-3">
+                                                <div>
+                                                    <label className="text-xs text-gray-400 mb-2 block">BG Color</label>
+                                                    <div className="flex items-center gap-2">
+                                                        <input type="color" value={recWmConfig.bgColor}
+                                                            onChange={e => updateRecWm({ bgColor: e.target.value })}
+                                                            className="w-9 h-8 rounded cursor-pointer border border-white/10 bg-transparent" />
+                                                        <code className="text-xs text-gray-500">{recWmConfig.bgColor}</code>
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <label className="text-xs text-gray-400 mb-1 block">BG Opacity: {Math.round(recWmConfig.bgOpacity * 100)}% {recWmConfig.bgOpacity === 0 && <span className="text-orange-600">(transparent)</span>}</label>
+                                                    <input type="range" min="0" max="1" step="0.05" value={recWmConfig.bgOpacity}
+                                                        onChange={e => updateRecWm({ bgOpacity: parseFloat(e.target.value) })}
+                                                        className="w-full accent-orange-500 mt-2" />
+                                                </div>
+                                            </div>
+
+                                            {/* Repeat toggle */}
+                                            <div className="flex items-center justify-between py-1">
+                                                <span className="text-xs text-gray-400 font-medium">Repeat Watermark (tile pattern)</span>
+                                                <button onClick={() => updateRecWm({ repeat: !recWmConfig.repeat })}
+                                                    className={`w-10 h-5 rounded-full transition-all ${recWmConfig.repeat ? 'bg-orange-500' : 'bg-gray-600'}`}>
+                                                    <div className={`w-4 h-4 bg-white rounded-full transition-transform mx-0.5 ${recWmConfig.repeat ? 'translate-x-5' : 'translate-x-0'}`} />
+                                                </button>
+                                            </div>
+
+                                            {recWmConfig.repeat ? (
+                                                /* Spacing controls */
+                                                <div className="grid grid-cols-2 gap-3">
+                                                    <div>
+                                                        <label className="text-xs text-gray-400 mb-1 block">Spacing X: {recWmConfig.spacingX}px</label>
+                                                        <input type="range" min="150" max="700" step="10" value={recWmConfig.spacingX}
+                                                            onChange={e => updateRecWm({ spacingX: parseInt(e.target.value) })}
+                                                            className="w-full accent-orange-500 mt-1" />
+                                                    </div>
+                                                    <div>
+                                                        <label className="text-xs text-gray-400 mb-1 block">Spacing Y: {recWmConfig.spacingY}px</label>
+                                                        <input type="range" min="50" max="400" step="10" value={recWmConfig.spacingY}
+                                                            onChange={e => updateRecWm({ spacingY: parseInt(e.target.value) })}
+                                                            className="w-full accent-orange-500 mt-1" />
+                                                    </div>
+                                                </div>
+                                            ) : (
+                                                /* Single-position offset */
+                                                <div className="grid grid-cols-2 gap-3">
+                                                    <div>
+                                                        <label className="text-xs text-gray-400 mb-1 block">Position X: {recWmConfig.offsetX > 0 ? '+' : ''}{recWmConfig.offsetX}%</label>
+                                                        <input type="range" min="-45" max="45" step="1" value={recWmConfig.offsetX}
+                                                            onChange={e => updateRecWm({ offsetX: parseInt(e.target.value) })}
+                                                            className="w-full accent-orange-500 mt-1" />
+                                                    </div>
+                                                    <div>
+                                                        <label className="text-xs text-gray-400 mb-1 block">Position Y: {recWmConfig.offsetY > 0 ? '+' : ''}{recWmConfig.offsetY}%</label>
+                                                        <input type="range" min="-45" max="45" step="1" value={recWmConfig.offsetY}
+                                                            onChange={e => updateRecWm({ offsetY: parseInt(e.target.value) })}
+                                                            className="w-full accent-orange-500 mt-1" />
+                                                    </div>
+                                                </div>
+                                            )}
+
+                                            {/* Logo upload */}
+                                            <div className="space-y-3">
+                                                <div className="flex items-center justify-between">
+                                                    <label className="text-xs text-gray-400 font-medium">Logo / Brand Image</label>
+                                                    <div className="flex items-center gap-2">
+                                                        <label className="px-2.5 py-1 bg-white/5 border border-white/10 rounded-lg text-xs text-gray-300 cursor-pointer hover:bg-white/10 transition-colors">
+                                                            {recWmConfig.logoDataUrl ? '✓ Change' : '+ Upload'}
+                                                            <input type="file" accept="image/*" className="hidden"
+                                                                onChange={e => {
+                                                                    const file = e.target.files?.[0];
+                                                                    if (!file) return;
+                                                                    const reader = new FileReader();
+                                                                    reader.onload = () => updateRecWm({ logoDataUrl: reader.result as string });
+                                                                    reader.readAsDataURL(file);
+                                                                }} />
+                                                        </label>
+                                                        {recWmConfig.logoDataUrl && (
+                                                            <>
+                                                                <img src={recWmConfig.logoDataUrl} alt="logo" className="w-7 h-7 object-contain rounded bg-white/5" />
+                                                                <button onClick={() => updateRecWm({ logoDataUrl: '', logoSize: 48 })} className="text-xs text-red-400 hover:text-red-300">Remove</button>
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                </div>
+
+                                                {recWmConfig.logoDataUrl && (
+                                                    <div className="bg-white/5 rounded-xl p-3 space-y-3 border border-white/5">
+                                                        {/* Size + Opacity */}
+                                                        <div className="grid grid-cols-2 gap-3">
+                                                            <div>
+                                                                <label className="text-xs text-gray-400 mb-1 block">Size: {recWmConfig.logoSize}px</label>
+                                                                <input type="range" min="16" max="120" step="4" value={recWmConfig.logoSize}
+                                                                    onChange={e => updateRecWm({ logoSize: parseInt(e.target.value) })}
+                                                                    className="w-full accent-orange-500" />
+                                                            </div>
+                                                            <div>
+                                                                <label className="text-xs text-gray-400 mb-1 block">Opacity: {Math.round(recWmConfig.logoOpacity * 100)}%</label>
+                                                                <input type="range" min="0.1" max="1" step="0.05" value={recWmConfig.logoOpacity}
+                                                                    onChange={e => updateRecWm({ logoOpacity: parseFloat(e.target.value) })}
+                                                                    className="w-full accent-orange-500" />
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Rotation */}
+                                                        <div>
+                                                            <label className="text-xs text-gray-400 mb-1 block">Rotation: {recWmConfig.logoRotation}°</label>
+                                                            <input type="range" min="-90" max="90" step="5" value={recWmConfig.logoRotation}
+                                                                onChange={e => updateRecWm({ logoRotation: parseInt(e.target.value) })}
+                                                                className="w-full accent-orange-500" />
+                                                        </div>
+
+                                                        {/* Repeat toggle */}
+                                                        <div className="flex items-center justify-between">
+                                                            <span className="text-xs text-gray-400 font-medium">Repeat Logo (tile pattern)</span>
+                                                            <button onClick={() => updateRecWm({ logoRepeat: !recWmConfig.logoRepeat })}
+                                                                className={`w-10 h-5 rounded-full transition-all ${recWmConfig.logoRepeat ? 'bg-orange-500' : 'bg-gray-600'}`}>
+                                                                <div className={`w-4 h-4 bg-white rounded-full transition-transform mx-0.5 ${recWmConfig.logoRepeat ? 'translate-x-5' : 'translate-x-0'}`} />
+                                                            </button>
+                                                        </div>
+
+                                                        {recWmConfig.logoRepeat ? (
+                                                            /* Logo spacing */
+                                                            <div className="grid grid-cols-2 gap-3">
+                                                                <div>
+                                                                    <label className="text-xs text-gray-400 mb-1 block">Spacing X: {recWmConfig.logoSpacingX}px</label>
+                                                                    <input type="range" min="80" max="600" step="10" value={recWmConfig.logoSpacingX}
+                                                                        onChange={e => updateRecWm({ logoSpacingX: parseInt(e.target.value) })}
+                                                                        className="w-full accent-orange-500 mt-1" />
+                                                                </div>
+                                                                <div>
+                                                                    <label className="text-xs text-gray-400 mb-1 block">Spacing Y: {recWmConfig.logoSpacingY}px</label>
+                                                                    <input type="range" min="50" max="400" step="10" value={recWmConfig.logoSpacingY}
+                                                                        onChange={e => updateRecWm({ logoSpacingY: parseInt(e.target.value) })}
+                                                                        className="w-full accent-orange-500 mt-1" />
+                                                                </div>
+                                                            </div>
+                                                        ) : (
+                                                            /* Logo X/Y offset */
+                                                            <div className="grid grid-cols-2 gap-3">
+                                                                <div>
+                                                                    <label className="text-xs text-gray-400 mb-1 block">Position X: {recWmConfig.logoOffsetX > 0 ? '+' : ''}{recWmConfig.logoOffsetX}%</label>
+                                                                    <input type="range" min="-45" max="45" step="1" value={recWmConfig.logoOffsetX}
+                                                                        onChange={e => updateRecWm({ logoOffsetX: parseInt(e.target.value) })}
+                                                                        className="w-full accent-orange-500 mt-1" />
+                                                                </div>
+                                                                <div>
+                                                                    <label className="text-xs text-gray-400 mb-1 block">Position Y: {recWmConfig.logoOffsetY > 0 ? '+' : ''}{recWmConfig.logoOffsetY}%</label>
+                                                                    <input type="range" min="-45" max="45" step="1" value={recWmConfig.logoOffsetY}
+                                                                        onChange={e => updateRecWm({ logoOffsetY: parseInt(e.target.value) })}
+                                                                        className="w-full accent-orange-500 mt-1" />
+                                                                </div>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
+                                            </div>
+
+                                            {/* Reset */}
+                                            <button onClick={() => updateRecWm(DEFAULT_REC_WM)}
+                                                className="w-full py-1.5 bg-white/5 border border-white/10 rounded-lg text-xs text-gray-500 hover:bg-white/10 hover:text-gray-300 transition-colors">
+                                                Reset to Defaults
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
 
                             {/* Advanced DRM Section Header */}
                             <div className="mt-4 pt-4 border-t border-white/10">
