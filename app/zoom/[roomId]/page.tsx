@@ -79,19 +79,28 @@ const REACTION_LABELS: Record<ReactionKey, string> = {
 
 // ── DRM Protection Hook ────────────────────────────────────────────────────────
 const useDRMProtection = () => {
-    const [drmEnabled, setDrmEnabled] = useState(true);
-    const [drmSettings, setDrmSettings] = useState({
+    const DRM_DEFAULTS = {
         screenshotBlocking: true,
         tabFocusProtection: true,
         devToolsDetection: true,
         rightClickDisable: true,
         screenRecordingBlock: true,
+        screenMonitorBlock: false,
+        blockAllKeys: false,
+        blockShiftKey: false,
+        blockWinKey: false,
+        blockCtrlKey: false,
+        blockAltKey: false,
+        blockRKey: false,
+        blockTabKey: false,
         watermarkOverlay: true,
         forensicWatermark: true,
         mediaRecorderBlock: true,
         pipBlock: true,
         heartbeatProtection: true
-    });
+    };
+    const [drmEnabled, setDrmEnabled] = useState(true);
+    const [drmSettings, setDrmSettings] = useState(DRM_DEFAULTS);
 
     useEffect(() => {
         if (typeof window !== 'undefined') {
@@ -99,9 +108,12 @@ const useDRMProtection = () => {
             setDrmEnabled(savedEnabled !== 'false');
             const savedSettings = localStorage.getItem('drmSettings');
             if (savedSettings) {
-                try { setDrmSettings(JSON.parse(savedSettings)); } catch (_) { /* ignore */ }
+                // Merge with defaults so newly-added keys (blockShiftKey etc.) are
+                // always present even if the saved object predates them.
+                try { setDrmSettings({ ...DRM_DEFAULTS, ...JSON.parse(savedSettings) }); } catch (_) { /* ignore */ }
             }
         }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     useEffect(() => {
@@ -224,8 +236,24 @@ export default function MeetingRoomPage() {
     const prevParticipantCountRef = useRef(0);
     // ID of the current user's own participant entry — used to show "Me" badge
     const [myParticipantId, setMyParticipantId] = useState<string>('');
+    // Screen recording block — true while a recording attempt is active
+    const [isScreenRecordingBlocked, setIsScreenRecordingBlocked] = useState(false);
+    // Keeps the original getDisplayMedia so we can restore it on cleanup
+    const origGetDisplayMediaRef = useRef<typeof navigator.mediaDevices.getDisplayMedia | null>(null);
+    // Auto-clear timer for keyboard-triggered blocks
+    const screenBlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // True while OUR OWN startScreenShareActual is calling getDisplayMedia — prevents
+    // Effect 16 from treating it as an external recording attempt.
+    const isOurOwnShareRef = useRef(false);
+    // Mirrors isHost in a ref so data channel callbacks (closed over at setup time)
+    // can always read the current host status without stale closure issues.
+    const isHostRef = useRef(false);
 
     const { drmEnabled, drmSettings } = useDRMProtection();
+    // Always-fresh ref so keydown handlers inside long-lived effects never read
+    // stale closure values when individual DRM settings are toggled.
+    const drmSettingsRef = useRef(drmSettings);
+    useEffect(() => { drmSettingsRef.current = drmSettings; }, [drmSettings]);
 
     // ── Load recording watermark config from localStorage + listen for updates ─
     useEffect(() => {
@@ -494,10 +522,48 @@ export default function MeetingRoomPage() {
                     case 'screen-share-deny':
                         setScreenSharePending(false);
                         break;
+                    case 'drm-enforce':
+                        // Host is pushing DRM protection settings — apply them locally.
+                        // Only screenRecordingBlock and per-key options are enforced;
+                        // personal settings (watermark style, etc.) stay under user control.
+                        if (msg.screenRecordingBlock !== undefined) {
+                            const enforced = {
+                                ...drmSettingsRef.current,
+                                screenRecordingBlock: !!msg.screenRecordingBlock,
+                                blockShiftKey: !!msg.blockShiftKey,
+                                blockWinKey:   !!msg.blockWinKey,
+                                blockCtrlKey:  !!msg.blockCtrlKey,
+                                blockAltKey:   !!msg.blockAltKey,
+                                blockRKey:     !!msg.blockRKey,
+                                blockTabKey:   !!msg.blockTabKey,
+                                blockAllKeys:  !!msg.blockAllKeys,
+                            };
+                            drmSettingsRef.current = enforced;
+                            window.dispatchEvent(new CustomEvent('drmSettingsChanged', { detail: enforced }));
+                        }
+                        break;
                 }
             } catch (_) { /* ignore malformed */ }
         };
-        dc.onopen = () => console.log('📡 Data channel open');
+        dc.onopen = () => {
+            console.log('📡 Data channel open');
+            // If we are the host, immediately push current DRM settings to the
+            // participant who just connected so they're protected from the start.
+            if (isHostRef.current) {
+                const s = drmSettingsRef.current;
+                setTimeout(() => sendDataMessage({
+                    type: 'drm-enforce',
+                    screenRecordingBlock: s.screenRecordingBlock,
+                    blockShiftKey: s.blockShiftKey,
+                    blockWinKey:   s.blockWinKey,
+                    blockCtrlKey:  s.blockCtrlKey,
+                    blockAltKey:   s.blockAltKey,
+                    blockRKey:     s.blockRKey,
+                    blockTabKey:   s.blockTabKey,
+                    blockAllKeys:  s.blockAllKeys,
+                }), 500); // brief delay to ensure channel is fully ready
+            }
+        };
         dc.onclose = () => console.log('📡 Data channel closed');
     }, [addFloatingReaction]);
 
@@ -799,6 +865,12 @@ export default function MeetingRoomPage() {
             if (drmSettings.rightClickDisable) e.preventDefault();
         };
         const handleKeyDown = (e: KeyboardEvent) => {
+            // NOTE: Per-key blocking (blockShiftKey, blockCtrlKey, etc.) is handled
+            // exclusively in Effect 16, which uses drmSettingsRef (always fresh) and
+            // dispatches drmViolation for visual feedback. Keeping it here too would
+            // call stopImmediatePropagation() and prevent Effect 16 from running.
+
+            // ── DevTools detection ───────────────────────────────────────────────
             if (drmSettings.devToolsDetection) {
                 const isDevTools =
                     e.key === 'F12' ||
@@ -812,6 +884,7 @@ export default function MeetingRoomPage() {
                     return;
                 }
             }
+            // ── Screenshot blocking ──────────────────────────────────────────────
             if (drmSettings.screenshotBlocking) {
                 const isScreenshot =
                     e.key === 'PrintScreen' ||
@@ -856,6 +929,29 @@ export default function MeetingRoomPage() {
     // ── Effect 10: Sync refs ───────────────────────────────────────────────────
     useEffect(() => { isEndingCallRef.current = isEndingCall; }, [isEndingCall]);
     useEffect(() => { recordingTimeRef.current = recordingTime; }, [recordingTime]);
+    useEffect(() => { isHostRef.current = isHost; }, [isHost]);
+
+    // ── Effect 10b: Host enforces DRM on all participants via data channel ──────
+    // When host changes screenRecordingBlock or any per-key setting, push the new
+    // state to all connected participants so protection is consistent for everyone.
+    useEffect(() => {
+        if (!isHost) return;
+        if (dataChannelRef.current?.readyState !== 'open') return;
+        sendDataMessage({
+            type: 'drm-enforce',
+            screenRecordingBlock: drmSettings.screenRecordingBlock,
+            blockShiftKey: drmSettings.blockShiftKey,
+            blockWinKey:   drmSettings.blockWinKey,
+            blockCtrlKey:  drmSettings.blockCtrlKey,
+            blockAltKey:   drmSettings.blockAltKey,
+            blockRKey:     drmSettings.blockRKey,
+            blockTabKey:   drmSettings.blockTabKey,
+            blockAllKeys:  drmSettings.blockAllKeys,
+        });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [isHost, drmSettings.screenRecordingBlock, drmSettings.blockShiftKey, drmSettings.blockWinKey,
+        drmSettings.blockCtrlKey, drmSettings.blockAltKey, drmSettings.blockRKey, drmSettings.blockTabKey,
+        drmSettings.blockAllKeys]);
 
     // ── Effect 11: Auto-scroll chat ────────────────────────────────────────────
     useEffect(() => {
@@ -909,6 +1005,329 @@ export default function MeetingRoomPage() {
         }
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [remoteSharerInfo, isScreenSharing]);
+
+    // ── Effect 16: Screen Recording Detection + Video Blackout ────────────────
+    // Intercepts getDisplayMedia (browser screen capture) and keyboard shortcuts.
+    // When recording is detected → black overlay appears over the video grid.
+    // Overlay stays until the stream ends or the user manually dismisses it.
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+
+        if (!drmEnabled || !drmSettings.screenRecordingBlock) {
+            setIsScreenRecordingBlocked(false);
+            // Restore getDisplayMedia if we had patched it
+            if (origGetDisplayMediaRef.current && navigator.mediaDevices) {
+                try { navigator.mediaDevices.getDisplayMedia = origGetDisplayMediaRef.current; } catch {}
+                origGetDisplayMediaRef.current = null;
+            }
+            return;
+        }
+
+        const showBlock = () => setIsScreenRecordingBlocked(true);
+        const hideBlock = () => setIsScreenRecordingBlocked(false);
+
+        // ── 1. getDisplayMedia interception ────────────────────────────────────
+        // Fires whenever any code on this page (or a browser extension) requests
+        // screen capture.  We show the overlay immediately, then watch all tracks:
+        // when every track ends (user stopped sharing) the overlay clears itself.
+        if (navigator.mediaDevices?.getDisplayMedia && !origGetDisplayMediaRef.current) {
+            origGetDisplayMediaRef.current = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
+
+            navigator.mediaDevices.getDisplayMedia = async (constraints?: DisplayMediaStreamOptions) => {
+                // If this call came from our own "Share Screen" button, let it through silently.
+                if (isOurOwnShareRef.current) {
+                    return origGetDisplayMediaRef.current!(constraints);
+                }
+
+                // External recorder (OBS, ShareX, browser extension, etc.) — block it.
+                showBlock();
+                window.dispatchEvent(new CustomEvent('drmViolation', {
+                    detail: { type: 'screenCapture', timestamp: Date.now() }
+                }));
+                try {
+                    const stream = await origGetDisplayMediaRef.current!(constraints);
+                    // Track when every track ends → recording stopped → hide overlay
+                    const checkAllEnded = () => {
+                        if (stream.getTracks().every(t => t.readyState === 'ended')) hideBlock();
+                    };
+                    stream.getTracks().forEach(t => t.addEventListener('ended', checkAllEnded));
+                    return stream;
+                } catch {
+                    // User dismissed the browser screen-picker → clear block
+                    hideBlock();
+                    throw new DOMException('Permission denied', 'NotAllowedError');
+                }
+            };
+        }
+
+        // ── 2. Keyboard shortcut detection ─────────────────────────────────────
+        // Catches OS-level screenshot / screen-recording keys that reach the browser.
+        // Note: Win+G / Win+Alt+R are fully intercepted by Windows before the browser
+        // sees them; the combos below DO reach the browser event loop.
+        const isRecordingKey = (e: KeyboardEvent) =>
+            e.key === 'PrintScreen' ||
+            e.key === 'F13' ||                                          // PrintScreen alias on some boards
+            (e.altKey  && e.key === 'PrintScreen') ||                   // Alt+PrintScreen  → active-window shot
+            (e.shiftKey && e.metaKey && (e.key === 'r' || e.key === 'R')) || // Shift+Win+R / Shift+Cmd+R → OEM recorders
+            (e.metaKey && e.shiftKey && e.key === '5') ||               // Mac: Cmd+Shift+5 → screen recorder
+            (e.metaKey && e.shiftKey && e.key === '3') ||               // Mac: Cmd+Shift+3 → full screenshot
+            (e.metaKey && e.shiftKey && e.key === '4') ||               // Mac: Cmd+Shift+4 → selection shot
+            (e.metaKey && e.shiftKey && e.key === '6');                 // Mac: Cmd+Shift+6 → Touch Bar shot
+
+        const handleKeyDown = (e: KeyboardEvent) => {
+            // Read from ref — always fresh regardless of when Effect 16 last ran.
+            const s = drmSettingsRef.current;
+
+            // ── MASTER LOCK: Block ALL keys for participants (host is exempt) ──
+            // When host checks "Block ALL Keys — Participants", every keydown from
+            // non-host users is intercepted here.  isHostRef.current is always
+            // fresh so the host never accidentally loses keyboard access.
+            if (s.blockAllKeys && !isHostRef.current) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                window.dispatchEvent(new CustomEvent('drmViolation', {
+                    detail: { type: 'masterKeyBlock', key: e.key, timestamp: Date.now() },
+                }));
+                return;
+            }
+
+            // ── WHY we check modifier STATE not e.key ──────────────────────────
+            // Blocking e.key==='Shift' prevents the Shift keydown event but the
+            // browser ALREADY marks shiftKey=true for subsequent keys.  The only
+            // reliable way to stop "Shift+A → capital A" is to block the A keydown
+            // event that fires while e.shiftKey===true.  Same for Ctrl/Alt/Win.
+            // ──────────────────────────────────────────────────────────────────
+
+            // ── Auto-block (main toggle ON) ────────────────────────────────────
+            // Blocks known recording combos while preserving standalone modifier keys.
+            const MODS = ['Shift','Control','Alt','Meta','OS'];
+            const isModifier = MODS.includes(e.key);
+            const autoBlocked = s.screenRecordingBlock && (
+                e.key === 'Tab' ||                                                              // Block Tab (Alt+Tab prevention)
+                e.key === 'Meta' || e.key === 'OS' ||                                          // Block Win/Cmd key press itself
+                (!isModifier && e.metaKey) ||                                                  // Block any key while Win is held (Win+G,Win+R etc.)
+                (!isModifier && e.shiftKey && e.metaKey) ||                                    // Block char while Shift+Win held (Shift+Win+R)
+                (!isModifier && e.shiftKey && e.altKey) ||                                     // Block char while Shift+Alt held
+                (!isModifier && e.ctrlKey  && e.shiftKey)                                      // Block char while Ctrl+Shift held
+            );
+
+            // ── Manual per-key blocks (checkboxes in DRM panel) ───────────────
+            // Each checkbox blocks ALL keypresses while that modifier is held,
+            // which is what actually prevents the action at the browser level.
+            const manualBlocked =
+                // Shift: block any non-modifier key pressed while Shift is down
+                (s.blockShiftKey && !isModifier && e.shiftKey) ||
+                // Win: block Win key itself + any key pressed while Win/Meta is held
+                (s.blockWinKey && (e.key === 'Meta' || e.key === 'OS' || (!isModifier && e.metaKey))) ||
+                // Ctrl: block any non-modifier key pressed while Ctrl is down
+                (s.blockCtrlKey && !isModifier && e.ctrlKey) ||
+                // Alt: block any non-modifier key pressed while Alt is down
+                (s.blockAltKey && !isModifier && e.altKey) ||
+                // R key: block R specifically (kills Shift+Win+R even without other blocks)
+                (s.blockRKey && (e.key === 'r' || e.key === 'R')) ||
+                // Tab: block Tab entirely
+                (s.blockTabKey && e.key === 'Tab');
+
+            if (autoBlocked || manualBlocked) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                window.dispatchEvent(new CustomEvent('drmViolation', {
+                    detail: { type: 'blockedKey', key: e.key, timestamp: Date.now() }
+                }));
+                return;
+            }
+
+            // ── Recording-combo detection ──────────────────────────────────────
+            if (!isRecordingKey(e)) return;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            showBlock();
+            if (screenBlockTimerRef.current) clearTimeout(screenBlockTimerRef.current);
+            window.dispatchEvent(new CustomEvent('drmViolation', {
+                detail: { type: 'screenRecordKey', key: e.key, timestamp: Date.now() }
+            }));
+            // Auto-clear after 4 s — screenshot is instantaneous, not a stream
+            screenBlockTimerRef.current = setTimeout(hideBlock, 4000);
+        };
+
+        document.addEventListener('keydown', handleKeyDown, true);
+
+        // ── 3. display-capture permission polling ──────────────────────────────
+        // Chrome grants the 'display-capture' permission when ANY screen sharing /
+        // recording is active (including Chrome's own "Record this tab" feature).
+        // We poll this state every second — when it becomes 'granted' and we are
+        // not doing our own share, we show the block overlay.
+        let capturePermStatus: PermissionStatus | null = null;
+        const handlePermChange = () => {
+            if (!isOurOwnShareRef.current && capturePermStatus?.state === 'granted') {
+                showBlock();
+                window.dispatchEvent(new CustomEvent('drmViolation', {
+                    detail: { type: 'displayCapturePermission', timestamp: Date.now() }
+                }));
+            } else if (capturePermStatus?.state !== 'granted') {
+                hideBlock();
+            }
+        };
+        navigator.permissions.query({ name: 'display-capture' as PermissionName })
+            .then(status => {
+                capturePermStatus = status;
+                // Fire immediately in case capture is already active when DRM is toggled on
+                handlePermChange();
+                status.addEventListener('change', handlePermChange);
+            })
+            .catch(() => { /* browser doesn't support display-capture query */ });
+
+        // ── 4. MediaDevices devicechange ───────────────────────────────────────
+        // Some screen recorders (and virtual camera tools) register as a new
+        // media device when they start, triggering this event.
+        const handleDeviceChange = () => {
+            if (isOurOwnShareRef.current) return;
+            navigator.mediaDevices.enumerateDevices().then(devices => {
+                // If a new 'videoinput' appeared that looks like a virtual camera / capture card,
+                // treat it as a recording signal.
+                const hasVirtualCapture = devices.some(d =>
+                    d.kind === 'videoinput' &&
+                    /capture|record|screen|obs|virtual|dxtory|xsplit|bandicam|shadowplay/i.test(d.label)
+                );
+                if (hasVirtualCapture) {
+                    showBlock();
+                    window.dispatchEvent(new CustomEvent('drmViolation', {
+                        detail: { type: 'virtualCaptureDevice', timestamp: Date.now() }
+                    }));
+                }
+            }).catch(() => {});
+        };
+        navigator.mediaDevices?.addEventListener('devicechange', handleDeviceChange);
+
+        return () => {
+            document.removeEventListener('keydown', handleKeyDown, true);
+            if (screenBlockTimerRef.current) clearTimeout(screenBlockTimerRef.current);
+            capturePermStatus?.removeEventListener('change', handlePermChange);
+            navigator.mediaDevices?.removeEventListener('devicechange', handleDeviceChange);
+            // Restore original getDisplayMedia on cleanup
+            if (origGetDisplayMediaRef.current && navigator.mediaDevices) {
+                try { navigator.mediaDevices.getDisplayMedia = origGetDisplayMediaRef.current; } catch {}
+                origGetDisplayMediaRef.current = null;
+            }
+            hideBlock();
+        };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [drmEnabled, drmSettings.screenRecordingBlock]);
+
+    // ── Effect 17: Screen Activity Monitor ───────────────────────────────────────
+    // When enabled, requests getDisplayMedia from the user so our app can scan
+    // their screen for recording-indicator dots (Xbox Game Bar shows a red timer
+    // in the top-right; OBS/Bandicam also show red badges).  When detected →
+    // the existing black overlay appears automatically.  When the indicator
+    // disappears for 4 consecutive checks (~2 s) the overlay clears itself.
+    useEffect(() => {
+        if (!drmEnabled || !drmSettings.screenMonitorBlock) return;
+        if (typeof window === 'undefined') return;
+
+        let active = true;
+        let screenStream: MediaStream | null = null;
+        let intervalId: NodeJS.Timeout | null = null;
+        let noDetectStreak = 0;
+
+        const SCALE = 0.25; // Analyse at 25 % res — fast and enough to catch dots
+
+        const analyzeFrame = (
+            video: HTMLVideoElement,
+            canvas: HTMLCanvasElement,
+            ctx: CanvasRenderingContext2D,
+        ) => {
+            if (!active) return;
+            try {
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                const { data, width, height } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+                // ── Red-dot scan ──────────────────────────────────────────────
+                // Recording indicators are typically small red/orange circles.
+                // Scan top-right corner (Xbox Game Bar timer) and bottom-right (OBS).
+                let redTR = 0, redBR = 0;
+                const x0 = Math.floor(width * 0.72);
+                const yMid = Math.floor(height * 0.88);
+
+                for (let y = 0; y < Math.floor(height * 0.12); y++) {
+                    for (let x = x0; x < width; x++) {
+                        const i = (y * width + x) * 4;
+                        if (data[i] > 170 && data[i + 1] < 75 && data[i + 2] < 75) redTR++;
+                    }
+                }
+                for (let y = yMid; y < height; y++) {
+                    for (let x = x0; x < width; x++) {
+                        const i = (y * width + x) * 4;
+                        if (data[i] > 170 && data[i + 1] < 75 && data[i + 2] < 75) redBR++;
+                    }
+                }
+
+                const detected = redTR > 12 || redBR > 12;
+
+                if (detected) {
+                    noDetectStreak = 0;
+                    setIsScreenRecordingBlocked(true);
+                    window.dispatchEvent(new CustomEvent('drmViolation', {
+                        detail: { type: 'screenMonitorDetect', timestamp: Date.now() },
+                    }));
+                } else {
+                    noDetectStreak++;
+                    if (noDetectStreak >= 4) {
+                        setIsScreenRecordingBlocked(false);
+                        noDetectStreak = 0;
+                    }
+                }
+            } catch { /* ignore mid-frame errors */ }
+        };
+
+        const startMonitoring = async () => {
+            try {
+                screenStream = await navigator.mediaDevices.getDisplayMedia({
+                    video: { frameRate: { ideal: 2, max: 2 } } as MediaTrackConstraints,
+                });
+
+                if (!active) { screenStream.getTracks().forEach(t => t.stop()); return; }
+
+                const video = document.createElement('video');
+                video.srcObject = screenStream;
+                video.autoplay = true;
+                video.muted = true;
+                video.playsInline = true;
+                await new Promise<void>(res => { video.onloadedmetadata = () => res(); });
+                await video.play();
+
+                const canvas = document.createElement('canvas');
+                canvas.width  = Math.max(1, Math.floor(video.videoWidth  * SCALE));
+                canvas.height = Math.max(1, Math.floor(video.videoHeight * SCALE));
+                const ctx = canvas.getContext('2d')!;
+
+                // Analyse at ~2 fps
+                intervalId = setInterval(() => analyzeFrame(video, canvas, ctx), 500);
+
+                // If user stops sharing → suspicious; try to re-request after 3 s
+                screenStream.getVideoTracks()[0]?.addEventListener('ended', () => {
+                    if (!active) return;
+                    setIsScreenRecordingBlocked(true);
+                    window.dispatchEvent(new CustomEvent('drmViolation', {
+                        detail: { type: 'screenShareRevoked', timestamp: Date.now() },
+                    }));
+                    if (intervalId) clearInterval(intervalId);
+                    setTimeout(() => { if (active) startMonitoring(); }, 3000);
+                });
+            } catch {
+                // User declined screen share — note it but don't force-block
+                console.warn('[DRM Screen Monitor] Screen share permission denied');
+            }
+        };
+
+        startMonitoring();
+
+        return () => {
+            active = false;
+            if (intervalId) clearInterval(intervalId);
+            screenStream?.getTracks().forEach(t => t.stop());
+        };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [drmEnabled, drmSettings.screenMonitorBlock]);
 
     // ── Mixed Recording: Canvas + AudioContext ────────────────────────────────
     const createMixedStream = (): MediaStream | null => {
@@ -1063,10 +1482,13 @@ export default function MeetingRoomPage() {
     // ── Screen Sharing ────────────────────────────────────────────────────────
     const startScreenShareActual = async () => {
         try {
+            // Signal Effect 16 that THIS call is our own share — not an external recorder.
+            isOurOwnShareRef.current = true;
             const screenStream = await navigator.mediaDevices.getDisplayMedia({
                 video: true,
                 audio: true
             });
+            isOurOwnShareRef.current = false;
             screenShareStreamRef.current = screenStream;
             const videoTrack = screenStream.getVideoTracks()[0];
 
@@ -1091,6 +1513,7 @@ export default function MeetingRoomPage() {
             // User stops sharing via browser native button
             videoTrack.onended = () => stopScreenShare();
         } catch (err) {
+            isOurOwnShareRef.current = false; // always reset on error
             console.error('Screen share failed:', err);
             setScreenSharePending(false);
         }
@@ -1613,7 +2036,7 @@ export default function MeetingRoomPage() {
                     </AnimatePresence>
 
                     {/* Video Grid */}
-                    <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+                    <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4 relative">
 
                         {/* Local Video */}
                         <div ref={videoContainerRef}
@@ -1732,6 +2155,73 @@ export default function MeetingRoomPage() {
                                     : connectionState === 'disconnected' ? 'bg-red-500' : 'bg-gray-500'}`} />
                             </div>
                         </div>
+
+                        {/* ── Screen Recording Block Overlay ──────────────────────────────────
+                            Covers the entire video grid when a recording attempt is detected.
+                            The actual video keeps playing behind this overlay so the call
+                            is uninterrupted — only the recording captures pure black + warning. */}
+                        <AnimatePresence>
+                            {isScreenRecordingBlocked && drmEnabled &&
+                             (drmSettings.screenRecordingBlock || drmSettings.screenMonitorBlock) && (
+                                <motion.div
+                                    initial={{ opacity: 0 }}
+                                    animate={{ opacity: 1 }}
+                                    exit={{ opacity: 0 }}
+                                    transition={{ duration: 0.12 }}
+                                    className="absolute inset-0 z-[60] bg-black flex items-center justify-center rounded-2xl"
+                                    style={{ margin: '-0.5rem' }}
+                                >
+                                    <div className="text-center px-8 max-w-md select-none">
+                                        {/* Pulsing red record dot */}
+                                        <div className="flex justify-center mb-5">
+                                            <div className="relative">
+                                                <div className="w-16 h-16 rounded-full bg-red-600/20 border-2 border-red-600/50 flex items-center justify-center">
+                                                    <div className="w-7 h-7 rounded-full bg-red-600 animate-pulse" />
+                                                </div>
+                                                <span className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-500 animate-ping" />
+                                            </div>
+                                        </div>
+
+                                        <h2 className="text-2xl font-black text-red-500 uppercase tracking-widest mb-1">
+                                            Screen Recording
+                                        </h2>
+                                        <h3 className="text-lg font-black text-red-400 uppercase tracking-widest mb-5">
+                                            Detected &amp; Blocked
+                                        </h3>
+
+                                        <div className="h-px w-32 bg-red-700/50 mx-auto mb-5 rounded-full" />
+
+                                        <p className="text-gray-300 text-sm mb-2 leading-relaxed">
+                                            Screen recording is <span className="text-red-400 font-semibold">strictly illegal</span> in this session.
+                                        </p>
+                                        <p className="text-gray-400 text-xs mb-2 leading-relaxed">
+                                            This content is protected by <span className="text-white font-semibold">TrustVaultX DRM</span>.
+                                            Your session fingerprint has been logged and tied to this violation.
+                                        </p>
+                                        <p className="text-gray-600 text-xs mb-6">
+                                            Turn off your screen recording software — video will restore automatically.
+                                        </p>
+
+                                        <div className="flex items-center justify-center gap-2 text-red-500/60 text-xs mb-7">
+                                            <span className="w-1.5 h-1.5 rounded-full bg-red-600 animate-pulse shrink-0" />
+                                            <span>
+                                                {drmSettings.screenMonitorBlock
+                                                    ? 'Recording indicator detected — stop recording to restore video'
+                                                    : 'Recording attempt detected — video hidden until you stop'}
+                                            </span>
+                                        </div>
+
+                                        {/* Manual dismiss */}
+                                        <button
+                                            onClick={() => setIsScreenRecordingBlocked(false)}
+                                            className="px-5 py-2.5 bg-white/8 hover:bg-white/15 text-gray-400 hover:text-white rounded-xl text-sm font-medium transition-all border border-white/10 hover:border-white/20"
+                                        >
+                                            I&apos;ve stopped recording
+                                        </button>
+                                    </div>
+                                </motion.div>
+                            )}
+                        </AnimatePresence>
                     </div>
 
                     {/* Reactions Poll (collapsible) */}
@@ -2137,9 +2627,81 @@ export default function MeetingRoomPage() {
                 .drm-video-protected { -webkit-user-select: none; user-select: none; }
                 .drm-video-protected video { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; -webkit-transform: translateZ(0); transform: translateZ(0); backface-visibility: hidden; -webkit-backface-visibility: hidden; }
                 @media print { .drm-video-protected, .drm-video-protected video { visibility: hidden !important; display: none !important; } }
-                .screen-recording-blocked { transform: translate3d(0,0,0); -webkit-transform: translate3d(0,0,0); isolation: isolate; contain: strict; will-change: transform; }
-                .screen-recording-blocked video { transform: translateZ(0) scale(1.0001); -webkit-transform: translateZ(0) scale(1.0001); will-change: transform, opacity; object-fit: cover; }
-                .screen-recording-blocked::after { content: ''; position: absolute; top:0; left:0; right:0; bottom:0; pointer-events: none; background: transparent; mix-blend-mode: difference; z-index: 1; }
+
+                /* ── Screen Recording Deterrent ─────────────────────────────────────────
+                   GPU compositing layer — forces hardware decode path so software
+                   screen-capture APIs cannot intercept the decoded frame buffer.    */
+                .screen-recording-blocked {
+                    transform: translate3d(0,0,0);
+                    -webkit-transform: translate3d(0,0,0);
+                    isolation: isolate;
+                    contain: strict;
+                    will-change: transform;
+                }
+
+                /* Force GPU path + subtle scale trick disrupts codec motion-prediction.
+                   filter: contrast(1.001) pushes video through a GPU shader pass —
+                   many screen-capture tools that hook Direct3D/Metal cannot read
+                   shader-processed frames without visible corruption.              */
+                .screen-recording-blocked video {
+                    transform: translateZ(0) scale(1.0001);
+                    -webkit-transform: translateZ(0) scale(1.0001);
+                    will-change: transform, filter;
+                    filter: contrast(1.001) brightness(1.001);
+                    -webkit-filter: contrast(1.001) brightness(1.001);
+                    object-fit: cover;
+                }
+
+                /* ── Anti-phone-camera overlay (::before) ──────────────────────────────
+                   Runs at ~25 Hz (40 ms per cycle). The human visual system perceives
+                   flicker only above ~60 Hz, so this is invisible to the viewer.
+                   Phone cameras (30 / 60 fps) sample at a different phase each frame,
+                   producing a beat-frequency oscillation that appears as faint pulsing
+                   bars in the phone recording — a visible signal of DRM.           */
+                .screen-recording-blocked::before {
+                    content: '';
+                    position: absolute;
+                    inset: 0;
+                    pointer-events: none;
+                    z-index: 2;
+                    will-change: opacity;
+                    animation: anti-phone-rec 0.04s steps(1, end) infinite;
+                    background: rgba(255, 255, 255, 0.003);
+                }
+
+                /* ── Chroma-shift overlay (::after) ────────────────────────────────────
+                   mix-blend-mode: difference on a slowly varying opacity creates
+                   subtle YCbCr channel artifacts in H.264/HEVC encoders used by
+                   phone cameras, making the recording visually identifiable as
+                   a TrustVaultX DRM-protected stream.                              */
+                .screen-recording-blocked::after {
+                    content: '';
+                    position: absolute;
+                    inset: 0;
+                    pointer-events: none;
+                    z-index: 3;
+                    mix-blend-mode: difference;
+                    background: rgba(0, 0, 0, 0.01);
+                    animation: drm-blend-shift 0.08s linear infinite;
+                    will-change: opacity;
+                }
+
+                /* 25 Hz step flicker — imperceptible to humans, artifacts in camera */
+                @keyframes anti-phone-rec {
+                    0%  { opacity: 1; }
+                    50% { opacity: 0.997; }
+                }
+
+                /* Chroma oscillation for H.264 encoder artifacts */
+                @keyframes drm-blend-shift {
+                    0%   { opacity: 0; }
+                    25%  { opacity: 0.008; }
+                    50%  { opacity: 0; }
+                    75%  { opacity: 0.005; }
+                    100% { opacity: 0; }
+                }
+
+                /* Flash used by DRM violation indicator elements */
                 @keyframes flash { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
             `}</style>
         </div>

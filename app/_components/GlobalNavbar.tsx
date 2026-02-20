@@ -53,6 +53,15 @@ const GlobalNavbar = () => {
         devToolsDetection: true,
         rightClickDisable: true,
         screenRecordingBlock: true,
+        screenMonitorBlock: false,
+        blockAllKeys: false,
+        // Per-key blockers (sub-options under screenRecordingBlock)
+        blockShiftKey: false,
+        blockWinKey: false,
+        blockCtrlKey: false,
+        blockAltKey: false,
+        blockRKey: false,
+        blockTabKey: false,
         watermarkOverlay: true,
         forensicWatermark: true,
         mediaRecorderBlock: true,
@@ -67,7 +76,9 @@ const GlobalNavbar = () => {
     useEffect(() => {
         if (typeof window !== 'undefined') {
             const saved = localStorage.getItem('drmSettings');
-            if (saved) setDrmSettings(JSON.parse(saved));
+            // Merge with current defaults so newly-added keys (blockShiftKey etc.) are
+            // always present even if the saved object predates them.
+            if (saved) setDrmSettings(prev => ({ ...prev, ...JSON.parse(saved) }));
             const savedRec = localStorage.getItem('recWmConfig');
             if (savedRec) {
                 try { setRecWmConfig({ ...DEFAULT_REC_WM, ...JSON.parse(savedRec) }); } catch (_) {}
@@ -342,25 +353,141 @@ const GlobalNavbar = () => {
                             </div>
 
                             {/* Block Screen Recording - Netflix Style */}
-                            <div className="flex items-center justify-between p-4 bg-gradient-to-r from-red-600/10 to-purple-600/10 rounded-xl border border-red-500/20">
-                                <div className="flex items-center gap-3">
-                                    <div className={`p-2 rounded-lg ${drmSettings.screenRecordingBlock ? 'bg-red-600/30 text-red-400' : 'bg-gray-600/20 text-gray-400'}`}>
-                                        <VideoOff className="w-5 h-5" />
+                            <div className={`flex flex-col p-4 bg-gradient-to-r from-red-600/10 to-purple-600/10 rounded-xl border transition-all ${drmSettings.screenRecordingBlock ? 'border-red-500/40' : 'border-red-500/20'}`}>
+                                {/* Main row */}
+                                <div className="flex items-center justify-between">
+                                    <div className="flex items-center gap-3">
+                                        <div className={`p-2 rounded-lg ${drmSettings.screenRecordingBlock ? 'bg-red-600/30 text-red-400' : 'bg-gray-600/20 text-gray-400'}`}>
+                                            <VideoOff className="w-5 h-5" />
+                                        </div>
+                                        <div>
+                                            <h3 className="font-medium text-white flex items-center gap-2">
+                                                Block Screen Recording
+                                                <span className="text-[10px] px-1.5 py-0.5 bg-red-600/30 text-red-400 rounded-full">Netflix-Style</span>
+                                            </h3>
+                                            <p className="text-xs text-gray-500">Hardware-accelerated black frame on capture</p>
+                                        </div>
                                     </div>
-                                    <div>
-                                        <h3 className="font-medium text-white flex items-center gap-2">
-                                            Block Screen Recording
-                                            <span className="text-[10px] px-1.5 py-0.5 bg-red-600/30 text-red-400 rounded-full">Netflix-Style</span>
-                                        </h3>
-                                        <p className="text-xs text-gray-500">Hardware-accelerated black frame on capture</p>
-                                    </div>
+                                    <button
+                                        onClick={() => updateSetting('screenRecordingBlock', !drmSettings.screenRecordingBlock)}
+                                        className={`w-12 h-6 rounded-full transition-all shrink-0 ${drmSettings.screenRecordingBlock ? 'bg-red-600' : 'bg-gray-600'}`}
+                                    >
+                                        <div className={`w-5 h-5 bg-white rounded-full transition-transform ${drmSettings.screenRecordingBlock ? 'translate-x-6' : 'translate-x-0.5'}`} />
+                                    </button>
                                 </div>
-                                <button
-                                    onClick={() => updateSetting('screenRecordingBlock', !drmSettings.screenRecordingBlock)}
-                                    className={`w-12 h-6 rounded-full transition-all ${drmSettings.screenRecordingBlock ? 'bg-red-600' : 'bg-gray-600'}`}
-                                >
-                                    <div className={`w-5 h-5 bg-white rounded-full transition-transform ${drmSettings.screenRecordingBlock ? 'translate-x-6' : 'translate-x-0.5'}`} />
-                                </button>
+
+                                {/* Per-key sub-options — only visible when main toggle is ON */}
+                                {drmSettings.screenRecordingBlock && (
+                                    <div className="mt-3 pt-3 border-t border-red-500/20">
+
+                                        {/* ── MASTER: Block ALL keys for participants ── */}
+                                        <button
+                                            onClick={() => updateSetting('blockAllKeys', !drmSettings.blockAllKeys)}
+                                            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border mb-3 transition-all ${
+                                                drmSettings.blockAllKeys
+                                                    ? 'bg-red-700/25 border-red-500/60 text-red-200'
+                                                    : 'bg-white/4 border-white/10 text-gray-400 hover:border-red-500/30 hover:text-gray-300'
+                                            }`}
+                                        >
+                                            {/* Checkbox */}
+                                            <div className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 ${drmSettings.blockAllKeys ? 'bg-red-600 border-red-400' : 'border-gray-500'}`}>
+                                                {drmSettings.blockAllKeys && (
+                                                    <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                                                    </svg>
+                                                )}
+                                            </div>
+                                            <div className="text-left min-w-0">
+                                                <div className="flex items-center gap-2 flex-wrap">
+                                                    <span className="text-[12px] font-bold leading-none">Block ALL Keys — Participants</span>
+                                                    <span className="text-[8px] px-1.5 py-0.5 bg-red-800/60 text-red-300 rounded font-semibold">MASTER LOCK</span>
+                                                </div>
+                                                <p className="text-[9px] mt-0.5 leading-snug opacity-70">
+                                                    {drmSettings.blockAllKeys
+                                                        ? '🔒 ALL participant keyboard input blocked — only host can type'
+                                                        : 'Enable to fully lock ALL keyboard keys for every participant'}
+                                                </p>
+                                            </div>
+                                        </button>
+
+                                        {/* Auto-active notice */}
+                                        <div className="flex items-center gap-2 mb-2.5">
+                                            <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse shrink-0" />
+                                            <p className="text-[10px] text-red-400/80 font-medium leading-snug">
+                                                Recording combos auto-blocked. Check to <span className="text-red-300">also block standalone key press</span>:
+                                            </p>
+                                        </div>
+                                        <div className="grid grid-cols-2 gap-1.5">
+                                            {([
+                                                { key: 'blockShiftKey', label: 'Shift',        autoHint: 'Auto: Shift+Win/Alt blocked', warn: 'Blocks ALL Shift+key (no CAPS)' },
+                                                { key: 'blockWinKey',   label: 'Windows / ⌘',  autoHint: 'Auto: Win+key blocked',       warn: 'Blocks Win+anything' },
+                                                { key: 'blockCtrlKey',  label: 'Ctrl',          autoHint: 'Auto: Ctrl+Shift blocked',    warn: 'Blocks ALL Ctrl+key (no Ctrl+C)' },
+                                                { key: 'blockAltKey',   label: 'Alt',           autoHint: 'Auto: Alt+Shift/Win blocked', warn: 'Blocks ALL Alt+key' },
+                                                { key: 'blockRKey',     label: 'R key',         autoHint: 'Blocks R (Shift+Win+R)',      warn: 'R key fully blocked' },
+                                                { key: 'blockTabKey',   label: 'Tab',           autoHint: 'Auto: Tab fully blocked',     warn: 'Tab already blocked by auto' },
+                                            ] as { key: keyof typeof drmSettings; label: string; autoHint: string; warn: string }[]).map(({ key, label, autoHint, warn }) => (
+                                                <button
+                                                    key={key}
+                                                    onClick={() => updateSetting(key, !drmSettings[key])}
+                                                    className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg border text-left transition-all ${
+                                                        drmSettings[key]
+                                                            ? 'bg-red-600/20 border-red-500/50 text-red-300'
+                                                            : 'bg-white/3 border-white/10 text-gray-500 hover:border-white/20 hover:text-gray-400'
+                                                    }`}
+                                                >
+                                                    <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center shrink-0 ${drmSettings[key] ? 'bg-red-500 border-red-400' : 'border-gray-600'}`}>
+                                                        {drmSettings[key] && (
+                                                            <svg className="w-2.5 h-2.5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                                                            </svg>
+                                                        )}
+                                                    </div>
+                                                    <div className="min-w-0">
+                                                        <div className="flex items-center gap-1 flex-wrap">
+                                                            <span className="text-[11px] font-semibold leading-none">{label}</span>
+                                                            <span className="text-[8px] px-1 py-0.5 bg-red-900/50 text-red-400/80 rounded leading-none font-medium">AUTO</span>
+                                                        </div>
+                                                        <div className="text-[9px] text-gray-600 leading-none mt-0.5 truncate">{drmSettings[key] ? warn : autoHint}</div>
+                                                    </div>
+                                                </button>
+                                            ))}
+                                        </div>
+                                        <p className="text-[9px] text-amber-700/80 mt-2.5 leading-relaxed">
+                                            ⚠ Standalone blocking disables normal keyboard use (Shift = no CAPS, Ctrl = no copy/paste). Use only for max lockdown.
+                                        </p>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Screen Activity Monitor */}
+                            <div className={`flex flex-col p-4 bg-gradient-to-r from-orange-600/10 to-amber-600/10 rounded-xl border transition-all ${drmSettings.screenMonitorBlock ? 'border-orange-500/40' : 'border-orange-500/20'}`}>
+                                <div className="flex items-center justify-between">
+                                    <div className="flex items-center gap-3">
+                                        <div className={`p-2 rounded-lg ${drmSettings.screenMonitorBlock ? 'bg-orange-600/30 text-orange-400' : 'bg-gray-600/20 text-gray-400'}`}>
+                                            <Eye className="w-5 h-5" />
+                                        </div>
+                                        <div>
+                                            <h3 className="font-medium text-white flex items-center gap-2">
+                                                Screen Activity Monitor
+                                                <span className="text-[10px] px-1.5 py-0.5 bg-orange-600/30 text-orange-400 rounded-full">Smart Detect</span>
+                                            </h3>
+                                            <p className="text-xs text-gray-500">Scans screen for recording indicators → auto black overlay</p>
+                                        </div>
+                                    </div>
+                                    <button
+                                        onClick={() => updateSetting('screenMonitorBlock', !drmSettings.screenMonitorBlock)}
+                                        className={`w-12 h-6 rounded-full transition-all shrink-0 ${drmSettings.screenMonitorBlock ? 'bg-orange-600' : 'bg-gray-600'}`}
+                                    >
+                                        <div className={`w-5 h-5 bg-white rounded-full transition-transform ${drmSettings.screenMonitorBlock ? 'translate-x-6' : 'translate-x-0.5'}`} />
+                                    </button>
+                                </div>
+                                {drmSettings.screenMonitorBlock && (
+                                    <div className="mt-2.5 pt-2.5 border-t border-orange-500/20">
+                                        <p className="text-[10px] text-orange-400/80 leading-relaxed">
+                                            ⚡ Browser will ask you to <span className="text-orange-300 font-semibold">share your screen</span> — select your full display. The app scans for red recording-indicator dots (Xbox Game Bar, OBS, Bandicam). When detected, video blacks out automatically.
+                                        </p>
+                                    </div>
+                                )}
                             </div>
 
                             {/* Watermark Overlay - NEW */}
